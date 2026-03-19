@@ -3,8 +3,8 @@ from openai import OpenAI
 import pandas as pd
 import re
 
-# 1. AI 열쇠 설정 (박사님의 API 키를 여기에 넣으세요)
-client = OpenAI(api_key="sk-xxxx...") 
+# 1. AI 열쇠 설정 
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"]) 
 
 st.set_page_config(page_title="CRP Analysis System", layout="wide")
 
