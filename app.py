@@ -1,101 +1,122 @@
+
 import streamlit as st
 from openai import OpenAI
 import pandas as pd
 import re
+import base64
 
-# 1. AI 열쇠 설정 
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"]) 
+# 1. AI 열쇠 및 기본 설정
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-st.set_page_config(page_title="CRP Analysis System", layout="wide")
+st.set_page_config(page_title="소백현: CRP Analysis System", layout="wide")
 
-# 헤더 부분
-st.title("🧠 소백현: CRP 인지 변화 분석 리포터")
-st.markdown("박사님의 CRP 설계도에 따라 학습자의 '날카로움'을 측정하고 전문가 해설을 제공합니다.")
+# 2. [디자인 지문] 나눔고딕 폰트 적용 로직
+def get_base64_font(font_path):
+    with open(font_path, "rb") as f:
+        data = f.read()
+    return base64.b64encode(data).decode()
+
+# 폰트 파일 경로 (작가님이 설정하신 assets 구조)
+font_path = "assets/fonts/NanumGothic-Regular.ttf"
+
+try:
+    base64_font = get_base64_font(font_path)
+    font_style = f"""
+    <style>
+    @font-face {{
+        font-family: 'SobaekhyunFont';
+        src: url(data:font/ttf;base64,{base64_font}) format('truetype');
+    }}
+    html, body, [class*="css"], .stMarkdown {{
+        font-family: 'SobaekhyunFont', sans-serif !important;
+    }}
+    </style>
+    """
+    st.markdown(font_style, unsafe_allow_html=True)
+except Exception:
+    st.caption("시스템 폰트를 로드 중입니다...")
+
+# 3. [보안/위장] 용어 매핑 정의
+# 내부용(CRP/MTI) -> 대외용(S-Core/Alpha/Beta)
+SECURITY_DICT = {
+    "MTI": "S-Core",
+    "Recognition": "Alpha-Density",
+    "Reconfiguration": "Beta-Density",
+    "Orchestration": "Gamma-Density",
+    "SAI": "V-Orbit"
+}
+
+# 4. 헤더 부분
+st.title("🛡️ 소백현: CRP 인지 변화 분석 리포터")
+st.markdown(f"**{SECURITY_DICT['MTI']}** 설계도에 따라 학습자의 '날카로움'을 측정하고 전문가 해설을 제공합니다.")
 st.divider()
 
-# --- 화면 분할 (좌측: 입력 / 우측: 결과) ---
+# --- 화면 분할 ---
 col1, col2 = st.columns([1, 1.2])
 
 with col1:
     st.subheader("📥 대화 로그 입력")
-    log_input = st.text_area("분석할 [Conversation Log]를 여기에 붙여넣으세요.", height=600, placeholder="대화 내용을 입력하고 아래 버튼을 누르세요...")
-    analyze_btn = st.button("🚀 CRP 분석 엔진 가동", use_container_width=True)
+    log_input = st.text_area("분석할 [Conversation Log]를 입력하세요.", height=550)
+    analyze_btn = st.button("🚀 분석 엔진 가동 (Secure Mode)", use_container_width=True)
 
 with col2:
-    st.subheader("📋 분석 리포트 및 전문가 해설")
+    st.subheader("📋 분석 리포트 (Secure Insights)")
     
-    if analyze_btn:
-        if log_input:
-            # --- 진행 표시 (Spinner) ---
-            with st.spinner("AI가 학습자의 사고 구조를 정밀 분석 중입니다. 잠시만 기다려 주세요..."):
+    if analyze_btn and log_input:
+        with st.spinner("인지 지문 분석 및 위장 보안 프로토콜 가동 중..."):
+            try:
+                # [동적 분석 엔진] 보안 위장 용어가 적용된 시스템 프롬프트
+                SYSTEM_PROMPT = f"""
+                너는 '소백현' 인지 분석 엔진이다. 다음 지침에 따라 로그를 분석하라.
+                
+                [보안 용어 강제 적용]
+                - MTI 대신 '{SECURITY_DICT['MTI']}'를 사용하라.
+                - SRI Recognition 대신 '{SECURITY_DICT['ALPHA']}'를 사용하라.
+                - SRI Reconfiguration 대신 '{SECURITY_DICT['BETA']}'를 사용하라.
+                - SRI Orchestration 대신 '{SECURITY_DICT['GAMMA']}'를 사용하라.
+                
+                [분석 가이드]
+                1. 정량 지표: {SECURITY_DICT['MTI']}는 1-6, 나머지는 1-10 점수로 산출.
+                2. 인사이트: 
+                   - '{SECURITY_DICT['BETA']}'가 9점 이상이면 '설계자적 퀀텀 점프'로 명명.
+                   - '{SECURITY_DICT['MTI']}' 6단계 판정 시 반드시 시스템 구조 비판 여부를 확인하라.
+                """
+                
+                # OpenAI API 호출
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": log_input}
+                    ],
+                    temperature=0.2 # 일관성 있는 분석을 위해 낮게 설정
+                )
+                
+                full_result = response.choices[0].message.content
+
+                # 시각화 (정규표현식으로 위장된 점수 추출)
                 try:
-                    # [업그레이드 완료] 새로운 설계를 반영한 시스템 프롬프트
-                    CRP_SYSTEM_PROMPT = """
-너는 CRP(Cognitive Re-configuration Protocol) 기반 학습 분석 시스템이며, 교육공학 전문가의 관점에서 통찰력 있는 해설을 제공해야 한다.
-제공된 로그를 분석하여 다음 형식을 엄격히 지켜 출력하라.
+                    scores = re.findall(r": (\d+)", full_result)
+                    if len(scores) >= 4:
+                        chart_data = pd.DataFrame({
+                            'Metric': ['Alpha', 'Beta', 'Gamma'],
+                            'Score': [int(scores[1]), int(scores[2]), int(scores[3])]
+                        })
+                        st.bar_chart(chart_data.set_index('Metric'))
+                except:
+                    pass
 
-### 1. 📊 정량적 지표 분석 (엄격 모드)
-[수치 산출 지침]
-- 모든 점수는 반드시 숫자로만 표기한다. (Low, Medium, High 등 형용사 사용 금지)
-- SRI 지표는 1~10 사이의 정수로 표기한다.
-- SAI 지표(SRR, TTR, POI)는 0.0~1.0 사이의 실수(비율)로 산출한다.
-
-- MTI Stage: (1~6 숫자)
-- SRI Recognition: (1~10 정수)
-- SRI Reconfiguration: (1~10 정수)
-- SRI Orchestration: (1~10 정수)
-- SAI SRR (Self-Reference): (0.0~1.0 실수)
-- SAI TTR (Lexical Diversity): (0.0~1.0 실수)
-- SAI POI (Objectivity): (0.0~1.0 실수)
-- SAI Level: (High/Medium/Low - 수치에 근거하여 표기)
-
-### 2. 💡 이번 분석 리포트의 핵심 관전 포인트 (Insight)
-이 섹션에서는 수치가 의미하는 바를 다음의 '날카로운' 관점에서 해설하라.
-
-[MTI 판정 특례]
-- Stage 6 (Recursive structuring): 학습자가 분석 시스템의 오류 가능성을 지적하거나, AI의 논리적 허점을 설계적 관점에서 비판할 경우 반드시 Stage 6를 부여한다. (단순 의문은 Stage 2)
-
-- MTI 해설: 학습자의 인지 구조가 현재 '도약' 단계인지, 아니면 시스템 자체를 조망하는 '재귀적' 단계인지 명확히 판정하라.
-- SRI 해설: 인식(Recognition)과 조합(Orchestration)의 간극을 통해 학습자의 강점과 보완점을 지적하라.
-- SAI 해설: 산출된 수치(SRR, TTR, POI)를 근거로 학습자의 메타인지적 주체성을 평가하라.
-
-Overall cognitive phase: (한 문장 요약)
-"""
-
-                    # API 호출
-                    response = client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[
-                            {"role": "system", "content": CRP_SYSTEM_PROMPT},
-                            {"role": "user", "content": f"[Conversation Log] :\n{log_input}"}
-                        ],
-                        temperature=0.3
-                    )
-                    
-                    full_result = response.choices[0].message.content
-
-                    # --- 막대 그래프 시각화 (숫자 추출 시도) ---
-                    try:
-                        # 정규표현식으로 SRI 점수 추출
-                        scores = re.findall(r"SRI \w+: (\d+)", full_result)
-                        if len(scores) >= 3:
-                            sri_data = pd.DataFrame({
-                                '지표': ['Recognition', 'Reconfiguration', 'Orchestration'],
-                                '점수': [int(scores[0]), int(scores[1]), int(scores[2])]
-                            })
-                            st.bar_chart(sri_data.set_index('지표'))
-                    except:
-                        st.caption("그래프 생성 중... (텍스트 분석 결과는 아래에 표시됩니다)")
-
-                    # 최종 결과 출력
-                    st.markdown(full_result)
-                    
-                except Exception as e:
-                    st.error(f"오류 발생: {e}")
-        else:
-            st.warning("분석할 로그 데이터를 먼저 입력해 주세요.")
-    else:
-        st.info("왼쪽에 로그를 입력하고 '분석 엔진 가동' 버튼을 누르면 리포트가 여기에 표시됩니다.")
+                # 최종 리포트 출력
+                st.markdown(full_result)
+                
+            except Exception as e:
+                st.error(f"보안 엔진 오류: {e}")
 
 st.divider()
-st.caption("© 2026 소백현 프로젝트 - SJ KIM CRP Analysis System")
+st.sidebar.markdown(f"""
+### 🛡️ Gatekeeper Status
+- **Font**: NanumGothic Applied
+- **Security**: {SECURITY_DICT['MTI']} Masking Active
+- **Protocol**: v1.5 Stable
+""")
+st.caption("© 2026 소백현 프로젝트 - Secure Cognitive Analysis System")
