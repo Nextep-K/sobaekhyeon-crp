@@ -1,122 +1,138 @@
-
 import streamlit as st
 from openai import OpenAI
 import pandas as pd
 import re
-import base64
+from datetime import datetime
+from fpdf import FPDF
+import io
 
-# 1. AI 열쇠 및 기본 설정
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+# 1. AI 열쇠 설정 (Streamlit Secrets 활용)
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"]) 
 
-st.set_page_config(page_title="소백현: CRP Analysis System", layout="wide")
+st.set_page_config(page_title="CRP Analysis System", layout="wide")
 
-# 2. [디자인 지문] 나눔고딕 폰트 적용 로직
-def get_base64_font(font_path):
-    with open(font_path, "rb") as f:
-        data = f.read()
-    return base64.b64encode(data).decode()
-
-# 폰트 파일 경로 (작가님이 설정하신 assets 구조)
-font_path = "assets/fonts/NanumGothic-Regular.ttf"
-
-try:
-    base64_font = get_base64_font(font_path)
-    font_style = f"""
-    <style>
-    @font-face {{
-        font-family: 'SobaekhyunFont';
-        src: url(data:font/ttf;base64,{base64_font}) format('truetype');
-    }}
-    html, body, [class*="css"], .stMarkdown {{
-        font-family: 'SobaekhyunFont', sans-serif !important;
-    }}
-    </style>
-    """
-    st.markdown(font_style, unsafe_allow_html=True)
-except Exception:
-    st.caption("시스템 폰트를 로드 중입니다...")
-
-# 3. [보안/위장] 용어 매핑 정의
-# 내부용(CRP/MTI) -> 대외용(S-Core/Alpha/Beta)
-SECURITY_DICT = {
-    "MTI": "S-Core",
-    "Recognition": "Alpha-Density",
-    "Reconfiguration": "Beta-Density",
-    "Orchestration": "Gamma-Density",
-    "SAI": "V-Orbit"
-}
-
-# 4. 헤더 부분
-st.title("🛡️ 소백현: CRP 인지 변화 분석 리포터")
-st.markdown(f"**{SECURITY_DICT['MTI']}** 설계도에 따라 학습자의 '날카로움'을 측정하고 전문가 해설을 제공합니다.")
+# 헤더 부분
+st.title("🧠 소백현: CRP 인지 변화 분석 리포터")
+st.markdown("학습자의 ID별로 인지 궤적을 추적하고 **알고리듬**으로 증명하는 전문가용 시스템입니다.")
 st.divider()
 
-# --- 화면 분할 ---
+# --- 화면 분할 (좌측: 입력 및 설정 / 우측: 결과 출력) ---
 col1, col2 = st.columns([1, 1.2])
 
 with col1:
-    st.subheader("📥 대화 로그 입력")
-    log_input = st.text_area("분석할 [Conversation Log]를 입력하세요.", height=550)
-    analyze_btn = st.button("🚀 분석 엔진 가동 (Secure Mode)", use_container_width=True)
+    st.subheader("👤 학습자 정보 설정")
+    # [수정 사항] 영문 7자 이내 아이디 입력 칸 추가
+    user_id = st.text_input(
+        "학습자 ID (영문 7자 이하)", 
+        max_chars=7, 
+        placeholder="예: SJKIM7",
+        help="데이터베이스 식별을 위한 고유 ID입니다. 이후 시계열 분석의 기준이 됩니다."
+    )
+    
+    st.subheader("📥 대화 로그 데이터")
+    log_input = st.text_area(
+        "분석할 [Conversation Log]를 입력하세요.", 
+        height=500,
+        placeholder="학습자와 AI 간의 대화 내용을 붙여넣으세요..."
+    )
+    
+    # 분석 실행 버튼
+    analyze_btn = st.button("🚀 CRP 분석 엔진 가동", use_container_width=True)
 
 with col2:
-    st.subheader("📋 분석 리포트 (Secure Insights)")
+    st.subheader("📋 분석 리포트 및 전문가 해설")
     
-    if analyze_btn and log_input:
-        with st.spinner("인지 지문 분석 및 위장 보안 프로토콜 가동 중..."):
-            try:
-                # [동적 분석 엔진] 보안 위장 용어가 적용된 시스템 프롬프트
-                SYSTEM_PROMPT = f"""
-                너는 '소백현' 인지 분석 엔진이다. 다음 지침에 따라 로그를 분석하라.
-                
-                [보안 용어 강제 적용]
-                - MTI 대신 '{SECURITY_DICT['MTI']}'를 사용하라.
-                - SRI Recognition 대신 '{SECURITY_DICT['ALPHA']}'를 사용하라.
-                - SRI Reconfiguration 대신 '{SECURITY_DICT['BETA']}'를 사용하라.
-                - SRI Orchestration 대신 '{SECURITY_DICT['GAMMA']}'를 사용하라.
-                
-                [분석 가이드]
-                1. 정량 지표: {SECURITY_DICT['MTI']}는 1-6, 나머지는 1-10 점수로 산출.
-                2. 인사이트: 
-                   - '{SECURITY_DICT['BETA']}'가 9점 이상이면 '설계자적 퀀텀 점프'로 명명.
-                   - '{SECURITY_DICT['MTI']}' 6단계 판정 시 반드시 시스템 구조 비판 여부를 확인하라.
-                """
-                
-                # OpenAI API 호출
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": log_input}
-                    ],
-                    temperature=0.2 # 일관성 있는 분석을 위해 낮게 설정
-                )
-                
-                full_result = response.choices[0].message.content
-
-                # 시각화 (정규표현식으로 위장된 점수 추출)
+    if analyze_btn:
+        if not user_id:
+            st.warning("학습자 ID를 먼저 설정해 주세요 (영문 7자 이내).")
+        elif not log_input:
+            st.warning("분석할 로그 데이터를 입력해 주세요.")
+        else:
+            # 분석 시각 및 데이터 생성
+            analysis_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            with st.spinner(f"[{user_id}] 학습자의 인지 구조를 알고리듬으로 분석 중입니다..."):
                 try:
-                    scores = re.findall(r": (\d+)", full_result)
-                    if len(scores) >= 4:
-                        chart_data = pd.DataFrame({
-                            'Metric': ['Alpha', 'Beta', 'Gamma'],
-                            'Score': [int(scores[1]), int(scores[2]), int(scores[3])]
-                        })
-                        st.bar_chart(chart_data.set_index('Metric'))
-                except:
-                    pass
+                    # 소백현 고유 알고리듬 프롬프트 (보안 코드네임 제거 버전)
+                    CRP_SYSTEM_PROMPT = """
+너는 CRP(Cognitive Re-configuration Protocol) 기반 학습 분석 시스템이다.
+제공된 로그를 분석하여 학습자의 인지적 진실을 데이터로 증명하라.
 
-                # 최종 리포트 출력
-                st.markdown(full_result)
-                
-            except Exception as e:
-                st.error(f"보안 엔진 오류: {e}")
+### 1. 📊 정량적 지표 분석
+- MTI Stage: (1~6 숫자)
+- SRI Recognition: (1~10 정수)
+- SRI Reconfiguration: (1~10 정수)
+- SRI Orchestration: (1~10 정수)
+- SAI SRR (Self-Reference): (0.0~1.0 실수)
+- SAI TTR (Lexical Diversity): (0.0~1.0 실수)
+- SAI POI (Objectivity): (0.0~1.0 실수)
+- SAI Level: (High/Medium/Low)
+
+### 2. 💡 분석 리포트 핵심 관전 포인트 (Insight)
+- MTI 해설: 학습자의 인지 구조가 시스템을 조망하는 Stage 6에 도달했는지 판정하라.
+- SRI 해설: 인식(Recognition)과 재구성(Reconfiguration)의 알고리듬적 조화를 분석하라.
+- SAI 해설: 수치에 기반하여 학습자의 메타인지적 주체성을 평가하라.
+
+Overall cognitive phase: (한 문장 요약)
+"""
+
+                    response = client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "system", "content": CRP_SYSTEM_PROMPT},
+                            {"role": "user", "content": f"ID: {user_id}\nTime: {analysis_time}\n[Log]:\n{log_input}"}
+                        ],
+                        temperature=0.3
+                    )
+                    full_result = response.choices[0].message.content
+                    
+                    # 분석 헤더 정보 시각화
+                    st.success(f"✅ 분석 완료 - ID: {user_id} | 일시: {analysis_time}")
+
+                    # --- SRI 지표 막대 그래프 ---
+                    scores = re.findall(r"SRI (?:Recognition|Reconfiguration|Orchestration): (\d+)", full_result)
+                    if len(scores) >= 3:
+                        sri_data = pd.DataFrame({
+                            '지표': ['Recognition', 'Reconfiguration', 'Orchestration'],
+                            '점수': [int(scores[0]), int(scores[1]), int(scores[2])]
+                        })
+                        st.bar_chart(sri_data.set_index('지표'))
+
+                    # 최종 결과 출력
+                    st.markdown(full_result)
+                    
+                    # --- PDF 생성 및 다운로드 ---
+                    st.divider()
+                    
+                    def create_pdf(content, u_id, a_time):
+                        pdf = FPDF()
+                        pdf.add_page()
+                        # 한글 폰트 설정 (저장소 내 NanumGothic.ttf 필수)
+                        try:
+                            pdf.add_font('Nanum', '', 'NanumGothic.ttf')
+                            pdf.set_font('Nanum', size=11)
+                        except:
+                            pdf.set_font("Helvetica", size=11)
+                        
+                        pdf.cell(0, 10, f"SKIM CRP Analysis Report - ID: {u_id}", ln=True, align='C')
+                        pdf.cell(0, 10, f"Analysis Time: {a_time}", ln=True, align='C')
+                        pdf.ln(5)
+                        clean_text = content.replace('#', '').replace('*', '')
+                        pdf.multi_cell(0, 8, txt=clean_text)
+                        return pdf.output()
+
+                    pdf_bytes = create_pdf(full_result, user_id, analysis_time)
+                    
+                    st.download_button(
+                        label=f"📄 {user_id}의 분석 리포트 PDF 출력 [y]",
+                        data=pdf_bytes,
+                        file_name=f"SKIM_{user_id}_{datetime.now().strftime('%m%d_%H%M')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+                    
+                except Exception as e:
+                    st.error(f"알고리듬 실행 중 오류가 발생했습니다: {e}")
 
 st.divider()
-st.sidebar.markdown(f"""
-### 🛡️ Gatekeeper Status
-- **Font**: NanumGothic Applied
-- **Security**: {SECURITY_DICT['MTI']} Masking Active
-- **Protocol**: v1.5 Stable
-""")
-st.caption("© 2026 소백현 프로젝트 - Secure Cognitive Analysis System")
+st.caption("© 2026 소백현 프로젝트 - SJ KIM CRP Analysis System | 설계자의 시선으로 인지를 관찰합니다.")
