@@ -28,25 +28,52 @@ if analyze_btn and user_id and log_input:
     with col2:
         analysis_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         results = []
+        
+        # [교정] progress_bar를 루프 밖에서 미리 선언
+        progress_text = st.empty()
         progress_bar = st.progress(0)
         
         try:
             for i in range(3):
-                st.caption(f"🔄 {i+1}차 알고리듬 가동 중...")
+                progress_text.text(f"🔄 {i+1}차 교차 검증 알고리듬 가동 중...")
+                
+                CRP_SYSTEM_PROMPT = """
+                너는 CRP 기반 학습 분석 시스템이다. 
+                반드시 아래의 [DATA] 섹션 형식을 엄격히 지켜 수치를 먼저 출력하라.
+                
+                [DATA]
+                MTI: (숫자)
+                REC: (숫자)
+                RECON: (숫자)
+                ORC: (숫자)
+                SRR: (숫자)
+                TTR: (숫자)
+                POI: (숫자)
+                
+                [INSIGHT]
+                (전문가 해설 내용 작성 - 여기서는 '지표명'이라는 단어를 쓰지 마라)
+                """
+                
                 response = client.chat.completions.create(
                     model="gpt-4o",
                     messages=[
-                        {"role": "system", "content": "너는 CRP 기반 학습 분석 시스템이다. 모든 지표는 '지표명: 숫자' 형식으로 엄격히 출력하라."},
-                        {"role": "user", "content": f"ID: {user_id}\n[Log]:\n{log_input}"}
+                        {"role": "system", "content": CRP_SYSTEM_PROMPT},
+                        {"role": "user", "content": f"ID: {user_id}\nLog:\n{log_input}"}
                     ],
                     temperature=0.1
                 )
                 text = response.choices[0].message.content
-                # 수치 추출 (MTI, SRI 3종, SAI 3종 순서)
-                nums = re.findall(r": (\d+\.?\d*)", text)
-                if len(nums) >= 7:
-                    results.append([float(n) for n in nums[:7]] + [text])
+                
+                # [교정] 데이터 섹션 정밀 추출
+                data_part = re.search(r"\[DATA\](.*?)\[INSIGHT\]", text, re.S)
+                if data_part:
+                    nums = re.findall(r": (\d+\.?\d*)", data_part.group(1))
+                    if len(nums) >= 7:
+                        results.append([float(n) for n in nums[:7]] + [text])
+                
                 progress_bar.progress((i + 1) * 33)
+            
+            progress_text.empty() # 진행 메시지 삭제
 
             if results:
                 # 데이터 프레임 생성 및 평균 계산
@@ -55,7 +82,7 @@ if analyze_btn and user_id and log_input:
 
                 st.success(f"✅ 앙상블 분석 완료 (ID: {user_id})")
                 
-                # --- 시각화 (Matplotlib를 이용해 PDF 삽입용 이미지 생성) ---
+                # --- 시각화 ---
                 fig, ax = plt.subplots(figsize=(6, 4))
                 labels = ['Recognition', 'Reconfiguration', 'Orchestration']
                 values = [avg['Rec'], avg['Recon'], avg['Orc']]
@@ -63,16 +90,16 @@ if analyze_btn and user_id and log_input:
                 ax.set_title(f"SRI Cognitive Structure (Avg) - {user_id}")
                 ax.set_ylim(0, 10)
                 
-                # 메모리에 그래프 저장
                 img_buf = io.BytesIO()
                 plt.savefig(img_buf, format='png')
-                st.image(img_buf) # 화면에 표시
+                st.image(img_buf)
 
-                # 리포트 본문 (마지막 분석 기준)
                 st.markdown("### 💡 전문가 종합 해설")
-                st.write(results[-1][-1])
+                # [교정] [DATA] 섹션을 제외한 해설 본문만 깔끔하게 출력
+                final_insight = results[-1][-1].split("[INSIGHT]")[-1].strip()
+                st.write(final_insight)
 
-                # --- PDF 생성 (그래프 포함) ---
+                # --- PDF 생성 함수 ---
                 def create_ensemble_pdf(content, u_id, time, chart_img, avg_data):
                     pdf = FPDF()
                     pdf.add_page()
@@ -86,28 +113,29 @@ if analyze_btn and user_id and log_input:
                     pdf.cell(0, 10, f"Date: {time}", ln=True, align='C')
                     pdf.ln(5)
                     
-                    # 그래프 삽입
                     chart_img.seek(0)
-                    pdf.image(chart_img, x=10, y=30, w=100)
-                    pdf.ln(70) # 그래프 공간 확보
+                    pdf.image(chart_img, x=10, y=35, w=120)
+                    pdf.ln(85) 
                     
-                    # 평균 수치 요약
+                    pdf.set_font(pdf.font_family, 'B', 12)
                     pdf.cell(0, 10, f"Average MTI Stage: {avg_data['MTI']:.1f}", ln=True)
+                    pdf.set_font(pdf.font_family, '', 11)
                     pdf.ln(5)
                     
                     clean_text = content.replace('#', '').replace('*', '')
                     pdf.multi_cell(0, 8, txt=clean_text)
                     return bytes(pdf.output())
 
-                pdf_bytes = create_ensemble_pdf(results[-1][-1], user_id, analysis_time, img_buf, avg)
+                pdf_bytes = create_ensemble_pdf(final_insight, user_id, analysis_time, img_buf, avg)
                 
+                st.divider()
                 st.download_button(
                     label="📄 그래프 포함 리포트 PDF 다운로드",
                     data=pdf_bytes,
-                    file_name=f"SKIM_Ensemble_{user_id}.pdf",
+                    file_name=f"SKIM_Ensemble_{user_id}_{datetime.now().strftime('%m%d')}.pdf",
                     mime="application/pdf",
                     use_container_width=True
                 )
 
         except Exception as e:
-            st.error(f"앙상블 알고리듬 실행 오류: {e}")
+            st.error(f"앙상블 알고리듬 실행 중 오류가 발생했습니다: {e}")
