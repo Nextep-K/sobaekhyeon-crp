@@ -30,9 +30,12 @@ def create_ensemble_pdf(content, u_id, time, chart_img, avg_data):
         has_font = False
 
     # 리포트 헤더
-    pdf.set_font('Nanum', 'B', 16) if has_font else pdf.set_font("Helvetica", 'B', 16)
+    header_font = ('Nanum', 'B', 16) if has_font else ("Helvetica", 'B', 16)
+    pdf.set_font(*header_font)
     pdf.cell(0, 15, "SKIM Ensemble Cognitive Report", ln=True, align='C')
-    pdf.set_font('Nanum', '', 10) if has_font else pdf.set_font("Helvetica", '', 10)
+    
+    sub_font = ('Nanum', '', 10) if has_font else ("Helvetica", '', 10)
+    pdf.set_font(*sub_font)
     pdf.cell(0, 5, f"ID: {u_id} | Date: {time}", ln=True, align='C')
     pdf.ln(10)
 
@@ -42,23 +45,28 @@ def create_ensemble_pdf(content, u_id, time, chart_img, avg_data):
     pdf.ln(95) 
 
     # 수치 요약
-    pdf.set_font('Nanum', 'B', 12) if has_font else pdf.set_font("Helvetica", 'B', 12)
+    title_font = ('Nanum', 'B', 12) if has_font else ("Helvetica", 'B', 12)
+    pdf.set_font(*title_font)
     pdf.cell(0, 10, " [ Ensemble Analytics Summary ]", ln=True)
-    pdf.set_font('Nanum', '', 11) if has_font else pdf.set_font("Helvetica", '', 11)
+    
+    body_font = ('Nanum', '', 11) if has_font else ("Helvetica", '', 11)
+    pdf.set_font(*body_font)
     for k, v in avg_data.items():
         if k in ['MTI', 'Rec', 'Recon', 'Orc']:
             pdf.cell(0, 8, f"• Average {k}: {v:.2f} / 10.0", ln=True)
     pdf.ln(5)
 
-    # 해설
-    pdf.set_font('Nanum', 'B', 12) if has_font else pdf.set_font("Helvetica", 'B', 12)
+    # 전문가 해설
+    pdf.set_font(*title_font)
     pdf.cell(0, 10, " [ Expert Insight ]", ln=True)
-    pdf.set_font('Nanum', '', 11) if has_font else pdf.set_font("Helvetica", '', 11)
+    pdf.set_font(*body_font)
     pdf.multi_cell(0, 8, txt=content.replace('#', '').replace('*', '').strip())
 
-    return bytes(pdf.output())
+    # [교정] 출력을 변수에 담아 바이트로 변환하여 반환 (화면 출력 차단)
+    pdf_out = pdf.output(dest='S')
+    return bytes(pdf_out) if isinstance(pdf_out, (str, bytearray)) else pdf_out
 
-# --- 메인 로직 (2회 반복으로 수정) ---
+# --- 메인 로직 ---
 col1, col2 = st.columns([1, 1.2])
 
 with col1:
@@ -74,7 +82,6 @@ if analyze_btn and user_id and log_input:
         progress_bar = st.progress(0)
         
         try:
-            # [수정] 반복 횟수를 2회로 단축
             for i in range(2):
                 response = client.chat.completions.create(
                     model="gpt-4o",
@@ -86,11 +93,11 @@ if analyze_btn and user_id and log_input:
                 )
                 text = response.choices[0].message.content
                 
-                # 정밀 추출 및 10점 만점 정규화
                 data_match = re.search(r"\[DATA\](.*?)\[INSIGHT\]", text, re.S)
                 if data_match:
                     vals = re.findall(r"(?:MTI|REC|RECON|ORC|SRR|TTR|POI):\s*(\d+\.?\d*)", data_match.group(1), re.I)
                     if len(vals) >= 7:
+                        # 10점 만점 정규화 로직 유지
                         num_vals = [float(v)/10 if float(v) > 10 else float(v) for v in vals[:7]]
                         results.append(num_vals + [text])
                 progress_bar.progress((i + 1) * 50)
@@ -114,8 +121,18 @@ if analyze_btn and user_id and log_input:
                 st.markdown("### 💡 전문가 종합 해설")
                 st.write(final_insight)
 
-                pdf_bytes = create_ensemble_pdf(final_insight, user_id, analysis_time, img_buf, avg)
-                st.download_button("📄 PDF 리포트 다운로드", data=pdf_bytes, file_name=f"SKIM_{user_id}.pdf", mime="application/pdf")
+                # [교정] 리턴값을 변수에만 저장하고 st.write() 등에 노출하지 않음
+                pdf_data = create_ensemble_pdf(final_insight, user_id, analysis_time, img_buf, avg)
+                
+                # 다운로드 버튼에만 데이터 연결
+                if pdf_data:
+                    st.download_button(
+                        label="📄 PDF 리포트 다운로드", 
+                        data=pdf_data, 
+                        file_name=f"SKIM_{user_id}.pdf", 
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
 
         except Exception as e:
             st.error(f"오류 발생: {e}")
