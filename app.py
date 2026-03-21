@@ -304,10 +304,9 @@ with tab_analyze:
                     ["MTI","Rec","Recon","Orc"],
                     [avg["MTI"], avg["Rec"], avg["Recon"], avg["Orc"]],
                     color=["#9b59b6","#3498db","#e74c3c","#2ecc71"],
-                    yerr=[std["MTI"], std["Rec"], std["Recon"], std["Orc"]] if std is not None else None, 
+                    yerr=[std["MTI"], std["Rec"], std["Recon"], std["Orc"]] if std is not None else None,
                     capsize=5
                 )
-
                 ax.set_ylim(0, 10)
                 ax.set_title("Ensemble Average (with std)")
                 img_buf = io.BytesIO()
@@ -492,6 +491,28 @@ with tab_inflection:
                         col_a.metric("Acceleration", f"{row['acceleration']:+.2f}"
                                      if pd.notna(row['acceleration']) else "N/A")
                         col_b.write(f"**Insight Summary:** {row['insight_summary']}")
+
+                        # AI 심층 분석
+                        with st.spinner("AI 심층 분석 중..."):
+                            try:
+                                prompt = f"""
+아래 수치 변화를 학습자의 '인지 전략' 관점에서 2~3문장으로 해설하라.
+대학생이 이해할 수 있는 언어로, 단정적으로 써라.
+
+변곡점 유형: {tag} (Velocity: {row['velocity']:+.2f})
+MTI {row['MTI']:.2f} / Rec {row['Rec']:.2f} / Recon {row['Recon']:.2f} / Orc {row['Orc']:.2f}
+로그 요약: {row['insight_summary']}
+"""
+                                res = client.chat.completions.create(
+                                    model="gpt-4o",
+                                    messages=[{"role": "user", "content": prompt}],
+                                    temperature=0.3,
+                                    max_tokens=300
+                                )
+                                analysis = res.choices[0].message.content.strip()
+                                st.markdown(f"**🧠 AI 심층 분석**\n\n{analysis}")
+                            except Exception as e:
+                                st.warning(f"분석 오류: {e}")
             else:
                 st.info("No significant inflection points detected in current interval.")
 
