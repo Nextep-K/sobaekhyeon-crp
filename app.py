@@ -116,40 +116,77 @@ def load_timeseries(u_id: str) -> pd.DataFrame | None:
 # PDF 생성
 # ─────────────────────────────────────────────
 
+def _ascii_bar(score: float, width: int = 20) -> str:
+    """텍스트 바 시각화: score 10점 기준, 예) [####........] 7.3"""
+    filled = round(score / 10 * width)
+    return f"[{'#' * filled}{'.' * (width - filled)}] {score:.2f}"
+
+
 def create_ensemble_pdf(content: str, u_id: str, time: str,
                         avg: pd.Series) -> bytes:
     """
-    이미지/한글 제거 버전 — latin1 호환 텍스트만 사용해 UnicodeEncodeError 완전 회피.
-    Insight는 영문 요약(ASCII)으로 대체.
+    프로토타입 수준 PDF — latin1 안전 텍스트만 사용.
+    ASCII 바로 점수 시각화, 구분선으로 섹션 분리.
     """
     pdf = FPDF()
     pdf.add_page()
+    W = pdf.w - pdf.l_margin - pdf.r_margin  # 유효 폭
+
+    # ── 헤더 ──
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 15, "SKIM Ensemble Cognitive Report", ln=True, align="C")
-
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, f"ID: {u_id}  |  Date: {time}  |  Ensemble N={ENSEMBLE_N}",
+    pdf.cell(0, 12, "SKIM Ensemble Cognitive Report", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 5, f"ID: {u_id}   |   Date: {time}   |   Ensemble N={ENSEMBLE_N}",
              ln=True, align="C")
-    pdf.ln(10)
-
-    # 수치 요약
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 10, "[ Ensemble Analytics Summary ]", ln=True)
-    pdf.set_font("Helvetica", "", 11)
-    for k in ["MTI", "Rec", "Recon", "Orc", "SRR", "TTR", "POI"]:
-        if k in avg:
-            pdf.cell(0, 8, f"  {k}: {avg[k]:.2f} / 10.0", ln=True)
+    pdf.ln(4)
+    pdf.set_draw_color(180, 180, 180)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
     pdf.ln(6)
 
-    # Insight — 한글을 latin1 안전 문자로 변환 후 삽입
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 10, "[ Expert Insight ]", ln=True)
-    pdf.set_font("Helvetica", "", 11)
+    # ── 핵심 4지표 (카드형 텍스트 블록) ──
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "[ Core Indicators ]", ln=True)
+    pdf.set_font("Courier", "", 10)  # 고정폭 폰트로 바 정렬
+    for k in ["MTI", "Rec", "Recon", "Orc"]:
+        if k in avg:
+            bar = _ascii_bar(avg[k])
+            pdf.cell(0, 7, f"  {k:<6} {bar}", ln=True)
+    pdf.ln(4)
+
+    # ── 보조 지표 ──
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "[ Sub Indicators ]", ln=True)
+    pdf.set_font("Courier", "", 10)
+    for k in ["SRR", "TTR", "POI"]:
+        if k in avg:
+            bar = _ascii_bar(avg[k])
+            pdf.cell(0, 7, f"  {k:<6} {bar}", ln=True)
+    pdf.ln(4)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
+    pdf.ln(6)
+
+    # ── Expert Insight (영문 변환) ──
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "[ Expert Insight ]", ln=True)
+    pdf.set_font("Helvetica", "", 10)
     safe_text = content.encode("latin1", errors="replace").decode("latin1")
-    pdf.multi_cell(0, 7, txt=safe_text)
+    pdf.multi_cell(0, 6, txt=safe_text)
+    pdf.ln(4)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
+
+    # ── 푸터 ──
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(160, 160, 160)
+    pdf.cell(0, 10, "SKIM Ensemble System  |  Prototype v3.1  |  Confidential",
+             ln=True, align="C")
 
     pdf_out = pdf.output(dest="S")
-    return bytes(pdf_out) if isinstance(pdf_out, (str, bytearray)) else pdf_out
+    if isinstance(pdf_out, bytes):
+        return pdf_out
+    elif isinstance(pdf_out, bytearray):
+        return bytes(pdf_out)
+    else:
+        return pdf_out.encode("latin1")  # FPDF1 Python3: str → bytes
 
 
 # ─────────────────────────────────────────────
