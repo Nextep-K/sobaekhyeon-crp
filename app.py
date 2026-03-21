@@ -38,10 +38,10 @@ def normalize_score(v: float) -> float:
     return max(1.0, min(10.0, round(v, 2)))
 
 
-def parse_response(text: str) -> tuple[list[float], str]:
-    data_match = re.search(r"\[DATA\](.*?)\[INSIGHT\]", text, re.S | re.I)
+def parse_response(text: str) -> tuple[list[float], str, str]:
+    data_match = re.search(r"\[DATA\](.*?)\[INSIGHT_KO\]", text, re.S | re.I)
     if not data_match:
-        raise ValueError("응답에서 [DATA]...[INSIGHT] 구조를 찾을 수 없습니다.")
+        raise ValueError("응답에서 [DATA]...[INSIGHT_KO] 구조를 찾을 수 없습니다.")
     raw_vals = re.findall(
         r"(?:MTI|REC|RECON|ORC|SRR|TTR|POI)\s*:\s*(\d+\.?\d*)",
         data_match.group(1), re.I
@@ -49,10 +49,16 @@ def parse_response(text: str) -> tuple[list[float], str]:
     if len(raw_vals) < len(INDICATORS):
         raise ValueError(f"지표 {len(INDICATORS)}개 필요, {len(raw_vals)}개만 파싱됨.")
     scores = [normalize_score(float(v)) for v in raw_vals[:len(INDICATORS)]]
-    insight = text.split("[INSIGHT]", 1)[-1].strip()
-    if not insight:
-        raise ValueError("INSIGHT 섹션이 비어 있습니다.")
-    return scores, insight
+
+    ko_match = re.search(r"\[INSIGHT_KO\](.*?)\[INSIGHT_EN\]", text, re.S | re.I)
+    en_match = re.search(r"\[INSIGHT_EN\](.*?)$", text, re.S | re.I)
+
+    insight_ko = ko_match.group(1).strip() if ko_match else ""
+    insight_en = en_match.group(1).strip() if en_match else ""
+
+    if not insight_ko or not insight_en:
+        raise ValueError("INSIGHT_KO 또는 INSIGHT_EN 섹션이 비어 있습니다.")
+    return scores, insight_ko, insight_en
 
 
 # ─────────────────────────────────────────────
@@ -85,7 +91,7 @@ def get_worksheet(u_id: str):
     return ws
 
 
-def save_timeseries(u_id: str, avg: pd.Series, insight: str) -> None:
+def save_timeseries(u_id: str, avg: pd.Series, insight_ko: str) -> None:
     ws = get_worksheet(u_id)
     ws.append_row([
         datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
@@ -93,7 +99,7 @@ def save_timeseries(u_id: str, avg: pd.Series, insight: str) -> None:
         round(float(avg["Recon"]), 2), round(float(avg["Orc"]),   2),
         round(float(avg["SRR"]),   2), round(float(avg["TTR"]),   2),
         round(float(avg["POI"]),   2),
-        insight[:100] + ("..." if len(insight) > 100 else "")
+        insight_ko[:100] + ("..." if len(insight_ko) > 100 else "")
     ])
 
 
@@ -120,13 +126,12 @@ def _ascii_bar(score: float, width: int = 20) -> str:
     return f"[{'#' * filled}{'.' * (width - filled)}] {score:.2f}"
 
 
-def create_ensemble_pdf(content: str, u_id: str, time: str,
+def create_ensemble_pdf(insight_en: str, u_id: str, time: str,
                         avg: pd.Series) -> bytes:
     pdf = FPDF()
     pdf.add_page()
     W = pdf.w - pdf.l_margin - pdf.r_margin
 
-    # 헤더
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 12, "SKIM Ensemble Cognitive Report", ln=True, align="C")
     pdf.set_font("Helvetica", "", 9)
@@ -137,7 +142,6 @@ def create_ensemble_pdf(content: str, u_id: str, time: str,
     pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
     pdf.ln(6)
 
-    # 핵심 4지표
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 8, "[ Core Indicators ]", ln=True)
     pdf.set_font("Courier", "", 10)
@@ -146,7 +150,6 @@ def create_ensemble_pdf(content: str, u_id: str, time: str,
             pdf.cell(0, 7, f"  {k:<6} {_ascii_bar(avg[k])}", ln=True)
     pdf.ln(4)
 
-    # 보조 지표
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 8, "[ Sub Indicators ]", ln=True)
     pdf.set_font("Courier", "", 10)
@@ -157,16 +160,14 @@ def create_ensemble_pdf(content: str, u_id: str, time: str,
     pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
     pdf.ln(6)
 
-    # Expert Insight (영문)
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 8, "[ Expert Insight ]", ln=True)
     pdf.set_font("Helvetica", "", 10)
-    safe_text = content.encode("latin1", errors="ignore").decode("latin1")
+    safe_text = insight_en.encode("latin1", errors="ignore").decode("latin1")
     pdf.multi_cell(0, 6, txt=safe_text)
     pdf.ln(4)
     pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
 
-    # 푸터
     pdf.set_font("Helvetica", "", 8)
     pdf.set_text_color(160, 160, 160)
     pdf.cell(0, 10, "SKIM Ensemble System  |  Prototype v3.1  |  Confidential",
@@ -232,9 +233,10 @@ with tab_analyze:
     if analyze_btn and user_id and log_input:
         with col2:
             analysis_time = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
-            scores_list: list[list[float]] = []
-            errors:      list[str]         = []
-            last_insight = ""
+            scores_list:     list[list[float]] = []
+            errors:          list[str]         = []
+            last_insight_ko: str               = ""  # UI·저장용 한글
+            last_insight_en: str               = ""  # PDF용 영문
 
             progress_bar = st.progress(0)
             status_text  = st.empty()
@@ -253,16 +255,20 @@ with tab_analyze:
                                     "[DATA]\n"
                                     "MTI: <1-10>\nREC: <1-10>\nRECON: <1-10>\n"
                                     "ORC: <1-10>\nSRR: <1-10>\nTTR: <1-10>\nPOI: <1-10>\n"
-                                    "[INSIGHT]\n<Expert insight in English only. No Korean.>"
+                                    "[INSIGHT_KO]\n<한국어 전문가 해설>\n"
+                                    "[INSIGHT_EN]\n<Same insight in English only.>"
                                 )
                             },
                             {"role": "user", "content": f"ID: {user_id}\nLog:\n{log_input}"}
                         ],
                         temperature=0.1
                     )
-                    scores, insight = parse_response(response.choices[0].message.content)
+                    scores, insight_ko, insight_en = parse_response(
+                        response.choices[0].message.content
+                    )
                     scores_list.append(scores)
-                    last_insight = insight
+                    last_insight_ko = insight_ko  # 한글
+                    last_insight_en = insight_en  # 영문
 
                 except ValueError as ve:
                     errors.append(f"회차 {i+1} 파싱 오류: {ve}")
@@ -320,16 +326,17 @@ with tab_analyze:
                         st.metric(label=f"{label} ({key})", value=f"{score:.2f}")
                         st.caption(comment)
 
+                # 전문가 해설 — 한글
                 st.markdown("### 💡 전문가 종합 해설")
-                st.write(last_insight)
+                st.write(last_insight_ko)
 
-                # 시계열 저장
-                save_timeseries(user_id, avg, last_insight)
+                # 시계열 저장 — 한글 요약
+                save_timeseries(user_id, avg, last_insight_ko)
                 st.info(f"💾 {user_id}님의 데이터가 시계열 저장소에 기록되었습니다.")
 
-                # PDF
+                # PDF — 영문 insight 전달
                 pdf_data = create_ensemble_pdf(
-                    last_insight, user_id, analysis_time, avg
+                    last_insight_en, user_id, analysis_time, avg
                 )
                 if pdf_data:
                     st.download_button(
@@ -360,7 +367,6 @@ with tab_dashboard:
             f"{hist_df['timestamp'].min().date()} ~ {hist_df['timestamp'].max().date()}"
         )
 
-        # 1. 인지 성장 선 그래프
         st.markdown("#### 📉 인지 성장 추이 (Orc · MTI)")
         fig2, ax2 = plt.subplots(figsize=(8, 3.5))
         ax2.plot(hist_df["timestamp"], hist_df["Orc"],
@@ -375,7 +381,6 @@ with tab_dashboard:
         st.pyplot(fig2)
         plt.close(fig2)
 
-        # 2. 패턴 감지
         st.markdown("#### 🔍 패턴 감지 (Orc 기준 급변 구간)")
         if len(hist_df) >= 2:
             hist_df["orc_delta"] = hist_df["Orc"].diff().abs()
@@ -396,7 +401,6 @@ with tab_dashboard:
         else:
             st.info("패턴 분석은 2회 이상 데이터 필요합니다.")
 
-        # 3. 히스토리 테이블
         st.markdown("#### 🗂️ 분석 히스토리")
         display_cols = ["timestamp","MTI","Rec","Recon","Orc","insight_summary"]
         st.dataframe(
