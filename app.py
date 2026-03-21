@@ -13,7 +13,7 @@ from google.oauth2.service_account import Credentials
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 st.set_page_config(page_title="SKIM Ensemble System", layout="wide")
-st.title("🧠 소백현: 앙상블 CRP 분석 엔진 (v 11.0)")
+st.title("🧠 소백현: 앙상블 CRP 분석 엔진 (Lite)")
 st.markdown("3회 교차 검증 **앙상블**을 통해 신뢰도를 높이고 인지 분석 리포트를 생성합니다.")
 st.divider()
 
@@ -135,7 +135,7 @@ def create_ensemble_pdf(content, u_id, time, chart_img, avg):
 
     chart_img.seek(0)
     chart_y = pdf.get_y()
-    pdf.image(chart_img, x=15, w=170, type='PNG')          # x 여백 통일, w 확대
+    pdf.image(chart_img, x=15, w=170)          # x 여백 통일, w 확대
     pdf.ln(8)                                   # 차트 하단 여백 (고정값 제거)
 
     pdf.set_font(*sf)
