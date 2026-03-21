@@ -1,5 +1,3 @@
-import tempfile
-import os
 import streamlit as st
 from openai import OpenAI
 import pandas as pd
@@ -119,49 +117,36 @@ def load_timeseries(u_id: str) -> pd.DataFrame | None:
 # ─────────────────────────────────────────────
 
 def create_ensemble_pdf(content: str, u_id: str, time: str,
-                        chart_img: io.BytesIO, avg: pd.Series) -> bytes:
+                        avg: pd.Series) -> bytes:
+    """
+    이미지/한글 제거 버전 — latin1 호환 텍스트만 사용해 UnicodeEncodeError 완전 회피.
+    Insight는 영문 요약(ASCII)으로 대체.
+    """
     pdf = FPDF()
     pdf.add_page()
-    try:
-        pdf.add_font("Nanum", "",  "NanumGothic.ttf")
-        pdf.add_font("Nanum", "B", "NanumGothicBold.ttf")
-        tf, bf, sf = ("Nanum","",11), ("Nanum","B",16), ("Nanum","B",12)
-    except Exception:
-        tf, bf, sf = ("Helvetica","",11), ("Helvetica","B",16), ("Helvetica","B",12)
-
-    # 헤더
-    pdf.set_font(*bf)
+    pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 15, "SKIM Ensemble Cognitive Report", ln=True, align="C")
-    pdf.set_font(*tf)
-    pdf.cell(0, 5, f"ID: {u_id} | Date: {time} | Ensemble N={ENSEMBLE_N}",
+
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, f"ID: {u_id}  |  Date: {time}  |  Ensemble N={ENSEMBLE_N}",
              ln=True, align="C")
     pdf.ln(10)
 
-    # 차트 삽입 — BytesIO → 임시 파일 경로로 전달 (FPDF 버전 호환)
-    chart_img.seek(0)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-        tmp.write(chart_img.read())
-        tmp_path = tmp.name
-    try:
-        pdf.image(tmp_path, x=15, w=170)  # y 고정값 제거 → 자동 커서 배치
-    finally:
-        os.unlink(tmp_path)               # 임시 파일 반드시 삭제
-    pdf.ln(8)
-
     # 수치 요약
-    pdf.set_font(*sf)
-    pdf.cell(0, 10, " [ Ensemble Analytics Summary ]", ln=True)
-    pdf.set_font(*tf)
-    for k in ["MTI", "Rec", "Recon", "Orc"]:
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 10, "[ Ensemble Analytics Summary ]", ln=True)
+    pdf.set_font("Helvetica", "", 11)
+    for k in ["MTI", "Rec", "Recon", "Orc", "SRR", "TTR", "POI"]:
         if k in avg:
-            pdf.cell(0, 8, f"  Average {k}: {avg[k]:.2f} / 10.0", ln=True)
-    pdf.ln(5)
+            pdf.cell(0, 8, f"  {k}: {avg[k]:.2f} / 10.0", ln=True)
+    pdf.ln(6)
 
-    # 전문가 해설
-    pdf.set_font(*sf)
-    pdf.cell(0, 10, " [ Expert Insight ]", ln=True)
-    pdf.set_font(*tf)
-    pdf.multi_cell(0, 8, txt=content.replace("#","").replace("*","").strip())
+    # Insight — 한글을 latin1 안전 문자로 변환 후 삽입
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 10, "[ Expert Insight ]", ln=True)
+    pdf.set_font("Helvetica", "", 11)
+    safe_text = content.encode("latin1", errors="replace").decode("latin1")
+    pdf.multi_cell(0, 7, txt=safe_text)
 
     pdf_out = pdf.output(dest="S")
     return bytes(pdf_out) if isinstance(pdf_out, (str, bytearray)) else pdf_out
@@ -317,7 +302,7 @@ with tab_analyze:
 
                 # PDF
                 pdf_data = create_ensemble_pdf(
-                    last_insight, user_id, analysis_time, img_buf, avg
+                    last_insight, user_id, analysis_time, avg
                 )
                 if pdf_data:
                     st.download_button(
