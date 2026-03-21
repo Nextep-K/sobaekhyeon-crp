@@ -213,7 +213,7 @@ def get_indicator_comment(key: str, score: float) -> str:
 # 탭 UI
 # ─────────────────────────────────────────────
 
-tab_analyze, tab_dashboard = st.tabs(["🔬 분석", "📈 시계열 대시보드"])
+tab_analyze, tab_dashboard, tab_inflection = st.tabs(["🔬 분석", "📈 시계열 대시보드", "🔍 변곡점 정밀 분석"])
 
 # ══════════════════════════════════════════════
 # TAB 1: 분석
@@ -417,3 +417,84 @@ with tab_dashboard:
             file_name=f"SKIM_history_{dash_id}.csv",
             mime="text/csv"
         )
+
+# ══════════════════════════════════════════════
+# TAB 3: 변곡점 정밀 분석
+# ══════════════════════════════════════════════
+with tab_inflection:
+    st.subheader("🔍 Cognitive Inflection Point Analysis")
+    inflect_id  = st.text_input("분석할 학습자 ID", value="sj", key="inflect_id")
+    inflect_btn = st.button("🔍 변곡점 분석 조회", key="inflect_btn", use_container_width=True)
+
+    if inflect_btn and inflect_id:
+        data = load_timeseries(inflect_id)
+        if data is not None and len(data) >= 2:
+            core_metrics = ["MTI", "Rec", "Recon", "Orc"]
+            colors = ["#3498db", "#2ecc71", "#e67e22", "#e74c3c"]
+
+            fig3, ax3 = plt.subplots(figsize=(11, 5))
+            for metric, color in zip(core_metrics, colors):
+                ax3.plot(data["timestamp"], data[metric],
+                         marker="o", label=metric, color=color, alpha=0.6, linewidth=1.5)
+
+            # Momentum · Velocity · Acceleration
+            data["momentum"]     = data[core_metrics].mean(axis=1)
+            data["velocity"]     = data["momentum"].diff()
+            data["acceleration"] = data["velocity"].diff()
+
+            v_std = data["velocity"].std()
+            threshold = v_std * 1.2 if v_std > 0 else 0.5  # 0 방어
+            inflections = data[data["velocity"].abs() > threshold]
+
+            # 변곡점 표시 — JUMP(초록) / PIVOT(회색)
+            for _, row in inflections.iterrows():
+                if row["velocity"] > 0:
+                    label_txt, line_color = "JUMP",  "#2ecc71"
+                else:
+                    label_txt, line_color = "PIVOT", "#95a5a6"
+                ax3.axvline(x=row["timestamp"], color=line_color, linestyle="--", alpha=0.4)
+                ax3.text(row["timestamp"], 10.3, label_txt,
+                         ha="center", fontsize=8, fontweight="bold", color=line_color)
+
+            ax3.set_ylim(0, 11)
+            ax3.set_ylabel("Cognitive Score")
+            ax3.set_title(f"Cognitive Trajectory: {inflect_id}", fontsize=12, pad=20)
+            ax3.legend(loc="upper left", bbox_to_anchor=(1, 1), frameon=False)
+            ax3.grid(axis="y", linestyle=":", alpha=0.3)
+            ax3.tick_params(axis="x", rotation=30)
+            plt.tight_layout()
+            st.pyplot(fig3)
+            plt.close(fig3)
+
+            # Momentum 면적 그래프 (유지)
+            st.markdown("#### 📊 Cognitive Momentum")
+            fig4, ax4 = plt.subplots(figsize=(11, 2.5))
+            ax4.fill_between(data["timestamp"], data["momentum"], alpha=0.3, color="#3498db")
+            ax4.plot(data["timestamp"], data["momentum"], color="#3498db", linewidth=2)
+            ax4.set_ylim(0, 10)
+            ax4.tick_params(axis="x", rotation=30)
+            plt.tight_layout()
+            st.pyplot(fig4)
+            plt.close(fig4)
+
+            # 변곡점 상세 패널
+            st.markdown("#### 🚩 Analysis Details")
+            if not inflections.empty:
+                for _, row in inflections.iterrows():
+                    tag = "Growth" if row["velocity"] > 0 else "Adjustment"
+                    with st.expander(
+                        f"[{tag}] {row['timestamp'].strftime('%m/%d %H:%M')} "
+                        f"| Velocity: {row['velocity']:+.2f}"
+                    ):
+                        col_a, col_b = st.columns([1, 4])
+                        col_a.metric("Velocity",     f"{row['velocity']:+.2f}")
+                        col_a.metric("Acceleration", f"{row['acceleration']:+.2f}"
+                                     if pd.notna(row['acceleration']) else "N/A")
+                        col_b.write(f"**Insight Summary:** {row['insight_summary']}")
+            else:
+                st.info("No significant inflection points detected in current interval.")
+
+        elif data is not None and len(data) < 3:
+            st.info(f"Minimum 2 sessions required. (Current: {len(data)})")
+        else:
+            st.info("No data found. Please run analysis first.")
