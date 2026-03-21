@@ -301,12 +301,13 @@ with tab_analyze:
                 # 차트
                 fig, ax = plt.subplots(figsize=(6, 4))
                 ax.bar(
-                    ["Rec","Recon","Orc"],
-                    [avg["Rec"], avg["Recon"], avg["Orc"]],
-                    color=["#3498db","#e74c3c","#2ecc71"],
-                    yerr=[std["Rec"], std["Recon"], std["Orc"]] if std is not None else None,
+                    ["MTI","Rec","Recon","Orc"],
+                    [avg["MTI"], avg["Rec"], avg["Recon"], avg["Orc"]],
+                    color=["#9b59b6","#3498db","#e74c3c","#2ecc71"],
+                    yerr=[std["MTI"], std["Rec"], std["Recon"], std["Orc"]] if std is not None else None, 
                     capsize=5
                 )
+
                 ax.set_ylim(0, 10)
                 ax.set_title("Ensemble Average (with std)")
                 img_buf = io.BytesIO()
