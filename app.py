@@ -3,6 +3,7 @@ from openai import OpenAI
 import pandas as pd
 import re
 from datetime import datetime
+import pytz
 from fpdf import FPDF
 import matplotlib.pyplot as plt
 import io
@@ -21,35 +22,33 @@ st.divider()
 
 INDICATORS = ['MTI', 'REC', 'RECON', 'ORC', 'SRR', 'TTR', 'POI']
 ENSEMBLE_N = 3
-SHEET_NAME  = "SKIM_Timeseries"
+SHEET_NAME = "SKIM_Timeseries"
+KST = pytz.timezone("Asia/Seoul")
+
 
 # ─────────────────────────────────────────────
 # 유틸
 # ─────────────────────────────────────────────
 
 def normalize_score(v: float) -> float:
-    """100/1000점 척도 방어 + 1~10 클램핑"""
     if v > 100:
         v = v / 10
     elif v > 10:
         v = v / 10
-    return max(1.0, min(10.0, round(v, 2)))  # 하한 1점
+    return max(1.0, min(10.0, round(v, 2)))
 
 
 def parse_response(text: str) -> tuple[list[float], str]:
-    """[DATA]...[INSIGHT] 구조 파싱. 실패 시 ValueError"""
     data_match = re.search(r"\[DATA\](.*?)\[INSIGHT\]", text, re.S | re.I)
     if not data_match:
         raise ValueError("응답에서 [DATA]...[INSIGHT] 구조를 찾을 수 없습니다.")
-
     raw_vals = re.findall(
         r"(?:MTI|REC|RECON|ORC|SRR|TTR|POI)\s*:\s*(\d+\.?\d*)",
         data_match.group(1), re.I
     )
     if len(raw_vals) < len(INDICATORS):
         raise ValueError(f"지표 {len(INDICATORS)}개 필요, {len(raw_vals)}개만 파싱됨.")
-
-    scores  = [normalize_score(float(v)) for v in raw_vals[:len(INDICATORS)]]
+    scores = [normalize_score(float(v)) for v in raw_vals[:len(INDICATORS)]]
     insight = text.split("[INSIGHT]", 1)[-1].strip()
     if not insight:
         raise ValueError("INSIGHT 섹션이 비어 있습니다.")
@@ -89,7 +88,7 @@ def get_worksheet(u_id: str):
 def save_timeseries(u_id: str, avg: pd.Series, insight: str) -> None:
     ws = get_worksheet(u_id)
     ws.append_row([
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
         round(float(avg["MTI"]),   2), round(float(avg["Rec"]),   2),
         round(float(avg["Recon"]), 2), round(float(avg["Orc"]),   2),
         round(float(avg["SRR"]),   2), round(float(avg["TTR"]),   2),
@@ -105,7 +104,7 @@ def load_timeseries(u_id: str) -> pd.DataFrame | None:
         if not rec:
             return None
         df = pd.DataFrame(rec)
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"].str.replace(" KST", "", regex=False))
         return df.sort_values("timestamp").reset_index(drop=True)
     except Exception as e:
         st.error(f"데이터 로드 오류: {e}")
@@ -117,22 +116,17 @@ def load_timeseries(u_id: str) -> pd.DataFrame | None:
 # ─────────────────────────────────────────────
 
 def _ascii_bar(score: float, width: int = 20) -> str:
-    """텍스트 바 시각화: score 10점 기준, 예) [####........] 7.3"""
     filled = round(score / 10 * width)
     return f"[{'#' * filled}{'.' * (width - filled)}] {score:.2f}"
 
 
 def create_ensemble_pdf(content: str, u_id: str, time: str,
                         avg: pd.Series) -> bytes:
-    """
-    프로토타입 수준 PDF — latin1 안전 텍스트만 사용.
-    ASCII 바로 점수 시각화, 구분선으로 섹션 분리.
-    """
     pdf = FPDF()
     pdf.add_page()
-    W = pdf.w - pdf.l_margin - pdf.r_margin  # 유효 폭
+    W = pdf.w - pdf.l_margin - pdf.r_margin
 
-    # ── 헤더 ──
+    # 헤더
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 12, "SKIM Ensemble Cognitive Report", ln=True, align="C")
     pdf.set_font("Helvetica", "", 9)
@@ -143,38 +137,36 @@ def create_ensemble_pdf(content: str, u_id: str, time: str,
     pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
     pdf.ln(6)
 
-    # ── 핵심 4지표 (카드형 텍스트 블록) ──
+    # 핵심 4지표
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 8, "[ Core Indicators ]", ln=True)
-    pdf.set_font("Courier", "", 10)  # 고정폭 폰트로 바 정렬
+    pdf.set_font("Courier", "", 10)
     for k in ["MTI", "Rec", "Recon", "Orc"]:
         if k in avg:
-            bar = _ascii_bar(avg[k])
-            pdf.cell(0, 7, f"  {k:<6} {bar}", ln=True)
+            pdf.cell(0, 7, f"  {k:<6} {_ascii_bar(avg[k])}", ln=True)
     pdf.ln(4)
 
-    # ── 보조 지표 ──
+    # 보조 지표
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 8, "[ Sub Indicators ]", ln=True)
     pdf.set_font("Courier", "", 10)
     for k in ["SRR", "TTR", "POI"]:
         if k in avg:
-            bar = _ascii_bar(avg[k])
-            pdf.cell(0, 7, f"  {k:<6} {bar}", ln=True)
+            pdf.cell(0, 7, f"  {k:<6} {_ascii_bar(avg[k])}", ln=True)
     pdf.ln(4)
     pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
     pdf.ln(6)
 
-    # ── Expert Insight (영문 변환) ──
+    # Expert Insight (영문)
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 8, "[ Expert Insight ]", ln=True)
     pdf.set_font("Helvetica", "", 10)
-    safe_text = content.encode("latin1", errors="replace").decode("latin1")
+    safe_text = content.encode("latin1", errors="ignore").decode("latin1")
     pdf.multi_cell(0, 6, txt=safe_text)
     pdf.ln(4)
     pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
 
-    # ── 푸터 ──
+    # 푸터
     pdf.set_font("Helvetica", "", 8)
     pdf.set_text_color(160, 160, 160)
     pdf.cell(0, 10, "SKIM Ensemble System  |  Prototype v3.1  |  Confidential",
@@ -186,7 +178,7 @@ def create_ensemble_pdf(content: str, u_id: str, time: str,
     elif isinstance(pdf_out, bytearray):
         return bytes(pdf_out)
     else:
-        return pdf_out.encode("latin1")  # FPDF1 Python3: str → bytes
+        return pdf_out.encode("latin1")
 
 
 # ─────────────────────────────────────────────
@@ -210,11 +202,10 @@ INDICATOR_GUIDE = {
 
 
 def get_indicator_comment(key: str, score: float) -> str:
-    """점수 구간(1~4 / 4~7 / 7~10)에 맞는 학습자 해설 반환"""
     for lo, hi, comment in INDICATOR_GUIDE[key][1]:
         if lo <= score < hi:
             return comment
-    return INDICATOR_GUIDE[key][1][-1][2]  # 10.0 엣지케이스 방어
+    return INDICATOR_GUIDE[key][1][-1][2]
 
 
 # ─────────────────────────────────────────────
@@ -240,7 +231,7 @@ with tab_analyze:
 
     if analyze_btn and user_id and log_input:
         with col2:
-            analysis_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            analysis_time = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
             scores_list: list[list[float]] = []
             errors:      list[str]         = []
             last_insight = ""
@@ -257,12 +248,12 @@ with tab_analyze:
                             {
                                 "role": "system",
                                 "content": (
-                                    "너는 CRP 분석 시스템이다.\n"
-                                    "반드시 아래 형식만 사용하라:\n"
+                                    "You are a CRP analysis system.\n"
+                                    "Always use ONLY this format:\n"
                                     "[DATA]\n"
                                     "MTI: <1-10>\nREC: <1-10>\nRECON: <1-10>\n"
                                     "ORC: <1-10>\nSRR: <1-10>\nTTR: <1-10>\nPOI: <1-10>\n"
-                                    "[INSIGHT]\n<한국어 전문가 해설>"
+                                    "[INSIGHT]\n<Expert insight in English only. No Korean.>"
                                 )
                             },
                             {"role": "user", "content": f"ID: {user_id}\nLog:\n{log_input}"}
@@ -312,7 +303,6 @@ with tab_analyze:
                 )
                 ax.set_ylim(0, 10)
                 ax.set_title("Ensemble Average (with std)")
-
                 img_buf = io.BytesIO()
                 plt.savefig(img_buf, format="png", bbox_inches="tight")
                 plt.close(fig)
@@ -396,7 +386,7 @@ with tab_dashboard:
                 st.success("급변 구간 없음 — 안정적인 성장 패턴입니다.")
             else:
                 for _, row in spikes.iterrows():
-                    prev_orc = hist_df.loc[row.name - 1, "Orc"] if row.name > 0 else row["Orc"]
+                    prev_orc  = hist_df.loc[row.name - 1, "Orc"] if row.name > 0 else row["Orc"]
                     direction = "📈 급상승" if row["Orc"] > prev_orc else "📉 급하락"
                     st.warning(
                         f"{direction} | {row['timestamp'].strftime('%Y-%m-%d %H:%M')} | "
