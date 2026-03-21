@@ -170,7 +170,7 @@ def create_ensemble_pdf(insight_en: str, u_id: str, time: str,
 
     pdf.set_font("Helvetica", "", 8)
     pdf.set_text_color(160, 160, 160)
-    pdf.cell(0, 10, "SKIM Ensemble System  |  Prototype v3.1  |  Confidential",
+    pdf.cell(0, 10,     "SKIM Ensemble System  |  v4.0  |  Confidential",
              ln=True, align="C")
 
     pdf_out = pdf.output(dest="S")
@@ -495,19 +495,29 @@ with tab_inflection:
                     # AI 심층 분석 — expander 밖에서 바로 출력
                     with st.spinner("AI 심층 분석 중..."):
                         try:
+                            session_series = "\n".join([
+                                f"세션 {i+1} ({r['timestamp'].strftime('%m/%d %H:%M')}): "
+                                f"MTI {r['MTI']:.2f} / Rec {r['Rec']:.2f} / "
+                                f"Recon {r['Recon']:.2f} / Orc {r['Orc']:.2f}"
+                                for i, r in data.iterrows()
+                            ])
                             prompt = f"""
-아래 수치 변화를 학습자의 '인지 전략' 관점에서 2~3문장으로 해설하라.
-대학생이 이해할 수 있는 언어로, 단정적으로 써라.
+아래는 학습자 {inflect_id}의 전체 세션 인지 수치 흐름이다.
+변곡점 위치를 기준으로, 전후 수치 변화를 학습자의 '인지 전략' 관점에서 3~5문장으로 해설하라.
+대학생이 이해할 수 있는 한국어로 써라.
+데이터가 {len(data)}회차임을 감안하여 단정보다 가능성으로 표현하라.
 
-변곡점 유형: {tag} (Velocity: {row['velocity']:+.2f})
-MTI {row['MTI']:.2f} / Rec {row['Rec']:.2f} / Recon {row['Recon']:.2f} / Orc {row['Orc']:.2f}
-로그 요약: {row['insight_summary']}
+[전체 수치 흐름]
+{session_series}
+
+변곡점: 세션 {row.name+1} ({row['timestamp'].strftime('%m/%d %H:%M')})
+유형: {tag} / Velocity: {row['velocity']:+.2f}
 """
                             res = client.chat.completions.create(
                                 model="gpt-4o",
                                 messages=[{"role": "user", "content": prompt}],
                                 temperature=0.3,
-                                max_tokens=300
+                                                                    max_tokens=500
                             )
                             analysis = res.choices[0].message.content.strip()
                             st.markdown(f"**🧠 AI 심층 분석**\n\n{analysis}")
