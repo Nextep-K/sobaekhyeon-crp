@@ -246,8 +246,12 @@ with tab_analyze:
                                     "Always use ONLY this format:\n\n"
                                     "[DATA]\n"
                                     "MTI: <1-10>\nREC: <1-10>\nRECON: <1-10>\nORC: <1-10>\n"
-                                    "[INSIGHT_KO]\n<한국어 전문가 해설>\n"
-                                    "[INSIGHT_EN]\n<Same insight in English only.>\n\n"
+                                    "[INSIGHT_KO]\n"
+                                    "<학습자의 인지 행동을 관찰하여 해설하라. "
+                                    "로그의 내용이 아닌 학습자가 어떻게 사고했는지를 중심으로 써라.>\n"
+                                    "[INSIGHT_EN]\n"
+                                    "<Same insight in English only. "
+                                    "Focus on how the learner thought, not what the log contains.>\n\n"
 
                                     "--- SCORING RUBRIC ---\n\n"
 
