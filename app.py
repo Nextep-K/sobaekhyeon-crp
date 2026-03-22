@@ -26,12 +26,10 @@ ENSEMBLE_N = 3
 SHEET_NAME = "SKIM_Timeseries"
 KST = pytz.timezone("Asia/Seoul")
 
-tab4 = st.tabs(["📋 CRP info"])
+tab_analyze, tab_dashboard, tab_inflection, tab4 = st.tabs(["🔬 분석", "📈 시계열 대시보드", "🔍 변곡점 정밀 분석", "📋 CRP info"])
 
 with tab4:
     components.html(open("landing.html", encoding="utf-8").read(), height=920)
-
-# 이하 기존 tab1, tab2, tab3 코드 그대로
 
 # ─────────────────────────────────────────────
 # 유틸
