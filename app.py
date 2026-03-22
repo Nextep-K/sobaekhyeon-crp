@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from openai import OpenAI
 import pandas as pd
 import re
@@ -9,6 +10,24 @@ import matplotlib.pyplot as plt
 import io
 import gspread
 from google.oauth2.service_account import Credentials
+
+# ─────────────────────────────────────────────
+# 랜딩 페이지
+# ─────────────────────────────────────────────
+st.set_page_config(page_title="소백현 CRP", layout="wide")
+
+if "landing_done" not in st.session_state:
+    st.session_state.landing_done = False
+
+if not st.session_state.landing_done:
+    clicked = components.html(
+        open("landing.html", encoding="utf-8").read(),
+        height=920
+    )
+    if clicked:
+        st.session_state.landing_done = True
+        st.rerun()
+    st.stop()
 
 # ─────────────────────────────────────────────
 # 설정
