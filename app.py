@@ -12,32 +12,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ─────────────────────────────────────────────
-# 랜딩 페이지
-# ─────────────────────────────────────────────
-st.set_page_config(page_title="소백현 CRP", layout="wide")
-
-if "landing_done" not in st.session_state:
-    st.session_state.landing_done = False
-
-if not st.session_state.landing_done:
-    components.html(
-        open("landing.html", encoding="utf-8").read(),
-        height=920
-    )
-    if st.button("▶ 분석 페이지로 이동", use_container_width=True):
-        st.session_state.landing_done = True
-        st.rerun()
-    st.stop()
-
-# ─────────────────────────────────────────────
-# 이하 기존 코드 그대로 (설정부터)
-# ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
 # 설정
 # ─────────────────────────────────────────────
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-st.set_page_config(page_title="SKIM Ensemble System", layout="wide")
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+st.set_page_config(page_title="소백현 CRP", layout="wide")
 st.title("🧠 소백현: 앙상블 CRP 분석 엔진 (Lite)")
 st.markdown("3회 교차 검증 **앙상블**을 통해 신뢰도를 높이고 인지 분석 리포트를 생성합니다.")
 st.divider()
@@ -47,6 +26,12 @@ ENSEMBLE_N = 3
 SHEET_NAME = "SKIM_Timeseries"
 KST = pytz.timezone("Asia/Seoul")
 
+tab1, tab2, tab3, tab4 = st.tabs(["🔬 분석", "📈 시계열 대시보드", "🔍 변곡점 정밀 분석", "📋 CRP info"])
+
+with tab4:
+    components.html(open("landing.html", encoding="utf-8").read(), height=920)
+
+# 이하 기존 tab1, tab2, tab3 코드 그대로
 
 # ─────────────────────────────────────────────
 # 유틸
