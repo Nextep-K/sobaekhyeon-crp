@@ -14,22 +14,24 @@ from google.oauth2.service_account import Credentials
 # ─────────────────────────────────────────────
 # 설정
 # ─────────────────────────────────────────────
-
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 st.set_page_config(page_title="소백현 CRP", layout="wide")
-st.title("🧠 소백현: 앙상블 CRP 분석 엔진 (Lite)")
+st.title("🧠 소백현: 앙상블 CRP 분석 엔진")
 st.markdown("3회 교차 검증 **앙상블**을 통해 신뢰도를 높이고 인지 분석 리포트를 생성합니다.")
 st.divider()
 
-INDICATORS = ['MTI', 'REC', 'RECON', 'ORC', 'SRR', 'TTR', 'POI']
+INDICATORS = ['MTI', 'REC', 'RECON', 'ORC']   # GPT 채점 4개
 ENSEMBLE_N = 3
 SHEET_NAME = "SKIM_Timeseries"
-KST = pytz.timezone("Asia/Seoul")
+KST        = pytz.timezone("Asia/Seoul")
 
-tab_analyze, tab_dashboard, tab_inflection, tab4 = st.tabs(["🔬 분석", "📈 시계열 대시보드", "🔍 변곡점 정밀 분석", "📋 CRP info"])
+tab_analyze, tab_dashboard, tab_inflection, tab4 = st.tabs([
+    "🔬 분석", "📈 시계열 대시보드", "🔍 변곡점 정밀 분석", "📋 CRP info"
+])
 
 with tab4:
     components.html(open("landing.html", encoding="utf-8").read(), height=920)
+
 
 # ─────────────────────────────────────────────
 # 유틸
@@ -48,7 +50,7 @@ def parse_response(text: str) -> tuple[list[float], str, str]:
     if not data_match:
         raise ValueError("응답에서 [DATA]...[INSIGHT_KO] 구조를 찾을 수 없습니다.")
     raw_vals = re.findall(
-        r"(?:MTI|REC|RECON|ORC|SRR|TTR|POI)\s*:\s*(\d+\.?\d*)",
+        r"(?:MTI|REC|RECON|ORC)\s*:\s*(\d+\.?\d*)",
         data_match.group(1), re.I
     )
     if len(raw_vals) < len(INDICATORS):
@@ -56,8 +58,7 @@ def parse_response(text: str) -> tuple[list[float], str, str]:
     scores = [normalize_score(float(v)) for v in raw_vals[:len(INDICATORS)]]
 
     ko_match = re.search(r"\[INSIGHT_KO\](.*?)\[INSIGHT_EN\]", text, re.S | re.I)
-    en_match = re.search(r"\[INSIGHT_EN\](.*?)$", text, re.S | re.I)
-
+    en_match = re.search(r"\[INSIGHT_EN\](.*?)$",              text, re.S | re.I)
     insight_ko = ko_match.group(1).strip() if ko_match else ""
     insight_en = en_match.group(1).strip() if en_match else ""
 
@@ -90,8 +91,7 @@ def get_worksheet(u_id: str):
     except gspread.WorksheetNotFound:
         ws = ss.add_worksheet(title=u_id, rows=1000, cols=20)
         ws.append_row([
-            "timestamp", "MTI", "Rec", "Recon", "Orc",
-            "SRR", "TTR", "POI", "insight_summary"
+            "timestamp", "MTI", "Rec", "Recon", "Orc", "insight_summary"
         ])
     return ws
 
@@ -102,8 +102,6 @@ def save_timeseries(u_id: str, avg: pd.Series, insight_ko: str) -> None:
         datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
         round(float(avg["MTI"]),   2), round(float(avg["Rec"]),   2),
         round(float(avg["Recon"]), 2), round(float(avg["Orc"]),   2),
-        round(float(avg["SRR"]),   2), round(float(avg["TTR"]),   2),
-        round(float(avg["POI"]),   2),
         insight_ko[:100] + ("..." if len(insight_ko) > 100 else "")
     ])
 
@@ -115,7 +113,9 @@ def load_timeseries(u_id: str) -> pd.DataFrame | None:
         if not rec:
             return None
         df = pd.DataFrame(rec)
-        df["timestamp"] = pd.to_datetime(df["timestamp"].str.replace(" KST", "", regex=False))
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"].str.replace(" KST", "", regex=False)
+        )
         return df.sort_values("timestamp").reset_index(drop=True)
     except Exception as e:
         st.error(f"데이터 로드 오류: {e}")
@@ -138,7 +138,7 @@ def create_ensemble_pdf(insight_en: str, u_id: str, time: str,
     W = pdf.w - pdf.l_margin - pdf.r_margin
 
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 12, "SKIM Ensemble Cognitive Report", ln=True, align="C")
+    pdf.cell(0, 12, "Sobaekhyeon CRP Cognitive Report", ln=True, align="C")
     pdf.set_font("Helvetica", "", 9)
     pdf.cell(0, 5, f"ID: {u_id}   |   Date: {time}   |   Ensemble N={ENSEMBLE_N}",
              ln=True, align="C")
@@ -151,14 +151,6 @@ def create_ensemble_pdf(insight_en: str, u_id: str, time: str,
     pdf.cell(0, 8, "[ Core Indicators ]", ln=True)
     pdf.set_font("Courier", "", 10)
     for k in ["MTI", "Rec", "Recon", "Orc"]:
-        if k in avg:
-            pdf.cell(0, 7, f"  {k:<6} {_ascii_bar(avg[k])}", ln=True)
-    pdf.ln(4)
-
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, "[ Sub Indicators ]", ln=True)
-    pdf.set_font("Courier", "", 10)
-    for k in ["SRR", "TTR", "POI"]:
         if k in avg:
             pdf.cell(0, 7, f"  {k:<6} {_ascii_bar(avg[k])}", ln=True)
     pdf.ln(4)
@@ -175,7 +167,7 @@ def create_ensemble_pdf(insight_en: str, u_id: str, time: str,
 
     pdf.set_font("Helvetica", "", 8)
     pdf.set_text_color(160, 160, 160)
-    pdf.cell(0, 10,     "SKIM Ensemble System  |  v4.0  |  Confidential",
+    pdf.cell(0, 10, "Sobaekhyeon CRP  |  v5.0  |  Confidential",
              ln=True, align="C")
 
     pdf_out = pdf.output(dest="S")
@@ -215,12 +207,8 @@ def get_indicator_comment(key: str, score: float) -> str:
 
 
 # ─────────────────────────────────────────────
-# 탭 UI
-# ─────────────────────────────────────────────
-
-# ══════════════════════════════════════════════
 # TAB 1: 분석
-# ══════════════════════════════════════════════
+# ─────────────────────────────────────────────
 with tab_analyze:
     col1, col2 = st.columns([1, 1.2])
 
@@ -235,11 +223,11 @@ with tab_analyze:
 
     if analyze_btn and user_id and log_input:
         with col2:
-            analysis_time = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+            analysis_time    = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
             scores_list:     list[list[float]] = []
             errors:          list[str]         = []
-            last_insight_ko: str               = ""  # UI·저장용 한글
-            last_insight_en: str               = ""  # PDF용 영문
+            last_insight_ko: str               = ""
+            last_insight_en: str               = ""
 
             progress_bar = st.progress(0)
             status_text  = st.empty()
@@ -253,13 +241,75 @@ with tab_analyze:
                             {
                                 "role": "system",
                                 "content": (
-                                    "You are a CRP analysis system.\n"
-                                    "Always use ONLY this format:\n"
+                                    "You are a CRP (Cognitive Re-configuration Protocol) analysis system.\n"
+                                    "Score each indicator from 1 to 10 based on the rubric below.\n"
+                                    "Always use ONLY this format:\n\n"
                                     "[DATA]\n"
-                                    "MTI: <1-10>\nREC: <1-10>\nRECON: <1-10>\n"
-                                    "ORC: <1-10>\nSRR: <1-10>\nTTR: <1-10>\nPOI: <1-10>\n"
+                                    "MTI: <1-10>\nREC: <1-10>\nRECON: <1-10>\nORC: <1-10>\n"
                                     "[INSIGHT_KO]\n<한국어 전문가 해설>\n"
-                                    "[INSIGHT_EN]\n<Same insight in English only.>"
+                                    "[INSIGHT_EN]\n<Same insight in English only.>\n\n"
+
+                                    "--- SCORING RUBRIC ---\n\n"
+
+                                    # MTI (사고 전환 · Meta-cognitive Tension Index)
+                                    # 학습자가 기존 논리를 스스로 수정하거나 관점을 전환하는
+                                    # 메타인지적 역동성을 측정한다.
+                                    # 자기 수정 발화 패턴("아니다","바꿔야겠다","틀렸다" 등),
+                                    # 충돌 후 전환까지 소요된 대화 턴 수, 성찰 발화의 심층도가 기준이다.
+                                    "MTI (Meta-cognitive Tension Index):\n"
+                                    "  1-3: No self-correction. Accepts all AI outputs passively. "
+                                    "No negation phrases or strategy revision detected.\n"
+                                    "  4-6: Occasionally uses negation or revision phrases "
+                                    "(e.g. 'that is wrong', 'I need to change this'). "
+                                    "Some strategic adjustment after cognitive conflict, "
+                                    "but transition takes many turns.\n"
+                                    "  7-10: Frequent self-negation and rapid perspective shifts "
+                                    "(within 1-2 turns after conflict). Actively restructures logic. "
+                                    "Deep reflective engagement with explicit reasoning about the change.\n\n"
+
+                                    # REC (재인식 · Recognition)
+                                    # 대화 흐름 속에서 핵심 패턴과 원리를 식별하는 능력을 측정한다.
+                                    # 단순 키워드 반복이 아닌 개념 간 관계 파악, 구조적 서술,
+                                    # 정보의 중요도를 핵심과 주변부로 분류하는 능력이 기준이다.
+                                    "REC (Recognition):\n"
+                                    "  1-3: Simple keyword repetition. Cannot distinguish core concepts "
+                                    "from peripheral details. No relational understanding.\n"
+                                    "  4-6: Identifies some connections between concepts. "
+                                    "Partial pattern recognition. Begins to separate important from "
+                                    "less important information but inconsistently.\n"
+                                    "  7-10: Articulates structural relationships clearly. "
+                                    "Accurately classifies information by importance. "
+                                    "Extracts core principles and maps concept interdependencies independently.\n\n"
+
+                                    # RECON (재구성 · Reconfiguration)
+                                    # 기존 지식을 해체하고 새로운 구조로 통합·재조립하는 역량을 측정한다.
+                                    # AI 제안 수용 대비 수정·재설계 비율, 독창적 대안 제시 여부,
+                                    # 초기 설계안과 최종 산출물 사이의 구조적 차이가 기준이다.
+                                    # Piaget의 조절(Accommodation)이 실제로 일어나고 있는지를 반영한다.
+                                    "RECON (Reconfiguration):\n"
+                                    "  1-3: Accepts AI output as-is. No restructuring or alternative proposals. "
+                                    "Final output is structurally identical to initial framing.\n"
+                                    "  4-6: Partially modifies AI suggestions. Some novel connections attempted. "
+                                    "Moderate structural difference between initial and final design.\n"
+                                    "  7-10: Independently redesigns solutions beyond AI input (Piaget Accommodation). "
+                                    "Creates new conceptual structures. Final output shows clear structural "
+                                    "transformation from initial framing. Original alternatives proposed.\n\n"
+
+                                    # ORC (조율 · Orchestration)
+                                    # AI와 자원을 전략적으로 운용하는 지휘 능력을 측정한다.
+                                    # 프롬프트 정교함, 작업 분해 및 순서화, AI 출력 검증 행동,
+                                    # 자원 배분의 타이밍이 기준이다.
+                                    # Orc가 안정적으로 유지되면 기저 조율 능력 확보의 신호로 해석한다.
+                                    "ORC (Orchestration):\n"
+                                    "  1-3: Vague, unstructured prompts. No task decomposition. "
+                                    "Passive AI use with no verification. Poor timing of resource allocation.\n"
+                                    "  4-6: Some structure in prompts with partial conditions. "
+                                    "Partial task sequencing. Occasionally reviews AI outputs. "
+                                    "Resource allocation timing is inconsistent.\n"
+                                    "  7-10: Precise, conditional prompts with clear constraints. "
+                                    "Systematic task decomposition and sequencing. "
+                                    "Actively verifies and redirects AI outputs at appropriate timing. "
+                                    "Stable orchestration across sessions signals consolidated baseline capability.\n"
                                 )
                             },
                             {"role": "user", "content": f"ID: {user_id}\nLog:\n{log_input}"}
@@ -270,8 +320,8 @@ with tab_analyze:
                         response.choices[0].message.content
                     )
                     scores_list.append(scores)
-                    last_insight_ko = insight_ko  # 한글
-                    last_insight_en = insight_en  # 영문
+                    last_insight_ko = insight_ko
+                    last_insight_en = insight_en
 
                 except ValueError as ve:
                     errors.append(f"회차 {i+1} 파싱 오류: {ve}")
@@ -288,8 +338,7 @@ with tab_analyze:
                         st.warning(err)
 
             if scores_list:
-                df  = pd.DataFrame(scores_list,
-                                   columns=["MTI","Rec","Recon","Orc","SRR","TTR","POI"])
+                df  = pd.DataFrame(scores_list, columns=["MTI","Rec","Recon","Orc"])
                 avg = df.mean()
                 std = df.std() if len(scores_list) > 1 else None
 
@@ -298,10 +347,9 @@ with tab_analyze:
                 if std is not None:
                     st.caption(
                         "📊 앙상블 표준편차 — "
-                        + " | ".join(f"{c}: ±{std[c]:.2f}" for c in ["Rec","Recon","Orc"])
+                        + " | ".join(f"{c}: ±{std[c]:.2f}" for c in ["MTI","Rec","Recon","Orc"])
                     )
 
-                # 차트
                 fig, ax = plt.subplots(figsize=(6, 4))
                 ax.bar(
                     ["MTI","Rec","Recon","Orc"],
@@ -318,7 +366,6 @@ with tab_analyze:
                 img_buf.seek(0)
                 st.image(img_buf)
 
-                # 학습자용 한 줄 해석 카드
                 st.markdown("### 📌 나의 인지 상태")
                 cols = st.columns(4)
                 for col, key in zip(cols, ["MTI","Rec","Recon","Orc"]):
@@ -329,15 +376,12 @@ with tab_analyze:
                         st.metric(label=f"{label} ({key})", value=f"{score:.2f}")
                         st.caption(comment)
 
-                # 전문가 해설 — 한글
                 st.markdown("### 💡 종합 해설")
                 st.write(last_insight_ko)
 
-                # 시계열 저장 — 한글 요약
                 save_timeseries(user_id, avg, last_insight_ko)
                 st.info(f"💾 {user_id}님의 데이터가 시계열 저장소에 기록되었습니다.")
 
-                # PDF — 영문 insight 전달
                 pdf_data = create_ensemble_pdf(
                     last_insight_en, user_id, analysis_time, avg
                 )
@@ -345,7 +389,7 @@ with tab_analyze:
                     st.download_button(
                         label="📄 PDF 요약 다운로드",
                         data=pdf_data,
-                        file_name=f"SKIM_{user_id}.pdf",
+                        file_name=f"CRP_{user_id}.pdf",
                         mime="application/pdf",
                         use_container_width=True
                     )
@@ -353,9 +397,9 @@ with tab_analyze:
                 st.error("❌ 모든 회차 분석 실패. 로그 형식 또는 API 상태를 확인하세요.")
 
 
-# ══════════════════════════════════════════════
+# ─────────────────────────────────────────────
 # TAB 2: 시계열 대시보드
-# ══════════════════════════════════════════════
+# ─────────────────────────────────────────────
 with tab_dashboard:
     st.subheader("📈 시계열 대시보드")
 
@@ -417,13 +461,14 @@ with tab_dashboard:
         st.download_button(
             label="⬇️ 시계열 데이터 CSV 다운로드",
             data=csv_bytes,
-            file_name=f"SKIM_history_{dash_id}.csv",
+            file_name=f"CRP_history_{dash_id}.csv",
             mime="text/csv"
         )
 
-# ══════════════════════════════════════════════
-# TAB 3: 변곡점 정밀 분석
-# ══════════════════════════════════════════════
+
+# ─────────────────────────────────────────────
+# TAB 3: 변곡점 정밀 분석 (Grokking — 시스템 계산)
+# ─────────────────────────────────────────────
 with tab_inflection:
     st.subheader("🔍 Cognitive Inflection Point Analysis")
     inflect_id  = st.text_input("분석할 학습자 ID", value="sj", key="inflect_id")
@@ -433,23 +478,22 @@ with tab_inflection:
         data = load_timeseries(inflect_id)
         if data is not None and len(data) >= 2:
             core_metrics = ["MTI", "Rec", "Recon", "Orc"]
-            colors = ["#3498db", "#2ecc71", "#e67e22", "#e74c3c"]
+            colors       = ["#9b59b6", "#3498db", "#e74c3c", "#2ecc71"]
 
             fig3, ax3 = plt.subplots(figsize=(11, 5))
             for metric, color in zip(core_metrics, colors):
                 ax3.plot(data["timestamp"], data[metric],
                          marker="o", label=metric, color=color, alpha=0.6, linewidth=1.5)
 
-            # Momentum · Velocity · Acceleration
+            # Grokking: velocity 기반 시스템 계산
             data["momentum"]     = data[core_metrics].mean(axis=1)
             data["velocity"]     = data["momentum"].diff()
             data["acceleration"] = data["velocity"].diff()
 
-            v_std = data["velocity"].std()
-            threshold = v_std * 1.2 if v_std > 0 else 0.5  # 0 방어
+            v_std     = data["velocity"].std()
+            threshold = v_std * 1.2 if v_std > 0 else 0.5
             inflections = data[data["velocity"].abs() > threshold]
 
-            # 변곡점 표시 — JUMP(초록) / PIVOT(회색)
             for _, row in inflections.iterrows():
                 if row["velocity"] > 0:
                     label_txt, line_color = "JUMP",  "#2ecc71"
@@ -469,7 +513,6 @@ with tab_inflection:
             st.pyplot(fig3)
             plt.close(fig3)
 
-            # Momentum 면적 그래프 (유지)
             st.markdown("#### 📊 Cognitive Momentum")
             fig4, ax4 = plt.subplots(figsize=(11, 2.5))
             ax4.fill_between(data["timestamp"], data["momentum"], alpha=0.3, color="#3498db")
@@ -480,7 +523,6 @@ with tab_inflection:
             st.pyplot(fig4)
             plt.close(fig4)
 
-            # 변곡점 상세 패널
             st.markdown("#### 🚩 Analysis Details")
             if not inflections.empty:
                 for _, row in inflections.iterrows():
@@ -495,7 +537,6 @@ with tab_inflection:
                                      if pd.notna(row['acceleration']) else "N/A")
                         col_b.write(f"**Insight Summary:** {row['insight_summary']}")
 
-                    # AI 심층 분석 — expander 밖에서 바로 출력
                     with st.spinner("AI 심층 분석 중..."):
                         try:
                             session_series = "\n".join([
@@ -520,17 +561,16 @@ with tab_inflection:
                                 model="gpt-4o",
                                 messages=[{"role": "user", "content": prompt}],
                                 temperature=0.3,
-                                                                    max_tokens=500
+                                max_tokens=500
                             )
-                            analysis = res.choices[0].message.content.strip()
-                            st.markdown(f"**🧠 AI 심층 분석**\n\n{analysis}")
+                            st.markdown(f"**🧠 AI 심층 분석**\n\n{res.choices[0].message.content.strip()}")
                             st.divider()
                         except Exception as e:
                             st.warning(f"분석 오류: {e}")
             else:
                 st.info("No significant inflection points detected in current interval.")
 
-        elif data is not None and len(data) < 3:
+        elif data is not None and len(data) < 2:
             st.info(f"Minimum 2 sessions required. (Current: {len(data)})")
         else:
             st.info("No data found. Please run analysis first.")
