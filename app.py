@@ -16,7 +16,7 @@ from google.oauth2.service_account import Credentials
 # ─────────────────────────────────────────────
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 st.set_page_config(page_title="소백현 CRP", layout="wide")
-st.title("🧠 소백현: 앙상블 CRP 분석 엔진")
+st.title("🧠 소백현: CRP 분석 엔진")
 st.markdown("3회 교차 검증을 통해 신뢰도를 높이고 인지 분석 리포트를 생성합니다.")
 st.divider()
 
@@ -102,7 +102,7 @@ def save_timeseries(u_id: str, avg: pd.Series, insight_ko: str) -> None:
         datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
         round(float(avg["MTI"]),   2), round(float(avg["Rec"]),   2),
         round(float(avg["Recon"]), 2), round(float(avg["Orc"]),   2),
-        insight_ko[:150] + ("..." if len(insight_ko) > 150 else "")
+        insight_ko[:350] + ("..." if len(insight_ko) > 350 else "")
     ])
 
 
@@ -190,7 +190,7 @@ def create_ensemble_pdf(insight_en: str, u_id: str, time: str,
 # ─────────────────────────────────────────────
 
 INDICATOR_GUIDE = {
-    "MTI":   ("사고 전환",  [(1,4,"새로운 시각으로 전환하는 데 어려움이 있어요."),
+    "MTI":   ("사고 전환",  [(1,4,"새로운 시각으로 전환하는 데 조금 어려움이 있어요."),
                              (4,7,"고정된 틀에서 벗어나려는 시도가 보여요."),
                              (7,11,"유연하게 관점을 바꾸며 사고하고 있어요.")]),
     "Rec":   ("재인식",     [(1,4,"기존 지식을 새 맥락에 연결하기 어려워하고 있어요."),
@@ -223,7 +223,7 @@ with tab_analyze:
         user_id   = st.text_input("학습자 ID", max_chars=10, value="id")
         log_input = st.text_area("분석할 [Conversation Log] 입력", height=500)
         analyze_btn = st.button(
-            f"🚀 앙상블 분석 ({ENSEMBLE_N}회 교차 검증)",
+            f"🚀 분석 시작 ({ENSEMBLE_N}회 교차 검증)",
             use_container_width=True
         )
 
