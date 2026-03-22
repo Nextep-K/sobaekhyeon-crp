@@ -26,7 +26,7 @@ ENSEMBLE_N = 3
 SHEET_NAME = "SKIM_Timeseries"
 KST = pytz.timezone("Asia/Seoul")
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔬 분석", "📈 시계열 대시보드", "🔍 변곡점 정밀 분석", "📋 CRP info"])
+tab4 = st.tabs(["📋 CRP info"])
 
 with tab4:
     components.html(open("landing.html", encoding="utf-8").read(), height=920)
@@ -230,7 +230,7 @@ with tab_analyze:
 
     with col1:
         st.subheader("👤 학습자 정보")
-        user_id   = st.text_input("학습자 ID", max_chars=10, value="sj")
+        user_id   = st.text_input("학습자 ID", max_chars=10, value="id")
         log_input = st.text_area("분석할 [Conversation Log] 입력", height=500)
         analyze_btn = st.button(
             f"🚀 앙상블 분석 ({ENSEMBLE_N}회 교차 검증)",
@@ -323,7 +323,7 @@ with tab_analyze:
                 st.image(img_buf)
 
                 # 학습자용 한 줄 해석 카드
-                st.markdown("### 📌 오늘 나의 인지 상태")
+                st.markdown("### 📌 나의 인지 상태")
                 cols = st.columns(4)
                 for col, key in zip(cols, ["MTI","Rec","Recon","Orc"]):
                     label   = INDICATOR_GUIDE[key][0]
@@ -334,7 +334,7 @@ with tab_analyze:
                         st.caption(comment)
 
                 # 전문가 해설 — 한글
-                st.markdown("### 💡 전문가 종합 해설")
+                st.markdown("### 💡 종합 해설")
                 st.write(last_insight_ko)
 
                 # 시계열 저장 — 한글 요약
@@ -347,7 +347,7 @@ with tab_analyze:
                 )
                 if pdf_data:
                     st.download_button(
-                        label="📄 PDF 리포트 다운로드",
+                        label="📄 PDF 요약 다운로드",
                         data=pdf_data,
                         file_name=f"SKIM_{user_id}.pdf",
                         mime="application/pdf",
