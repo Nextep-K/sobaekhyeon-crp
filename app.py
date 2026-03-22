@@ -16,8 +16,8 @@ from google.oauth2.service_account import Credentials
 # ─────────────────────────────────────────────
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 st.set_page_config(page_title="소백현 CRP", layout="wide")
-st.title("🧠 소백현: 앙상블 CRP 분석 엔진")
-st.markdown("3회 교차 검증 **앙상블**을 통해 신뢰도를 높이고 인지 분석 리포트를 생성합니다.")
+st.title("🧠 소백현: CRP 분석 엔진")
+st.markdown("3회 교차 검증을 통해 신뢰도를 높이고 인지 분석 리포트를 생성합니다.")
 st.divider()
 
 INDICATORS = ['MTI', 'REC', 'RECON', 'ORC']   # GPT 채점 4개
@@ -102,14 +102,16 @@ def save_timeseries(u_id: str, avg: pd.Series, insight_ko: str) -> None:
         datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
         round(float(avg["MTI"]),   2), round(float(avg["Rec"]),   2),
         round(float(avg["Recon"]), 2), round(float(avg["Orc"]),   2),
-        insight_ko[:100] + ("..." if len(insight_ko) > 100 else "")
+        insight_ko[:150] + ("..." if len(insight_ko) > 150 else "")
     ])
 
 
 def load_timeseries(u_id: str) -> pd.DataFrame | None:
     try:
         ws  = get_worksheet(u_id)
-        rec = ws.get_all_records()
+        rec = ws.get_all_records(expected_headers=[
+            "timestamp", "MTI", "Rec", "Recon", "Orc", "insight_summary"
+        ])
         if not rec:
             return None
         df = pd.DataFrame(rec)
@@ -214,10 +216,10 @@ with tab_analyze:
 
     with col1:
         st.subheader("👤 학습자 정보")
-        user_id   = st.text_input("학습자 ID", max_chars=10, value="id")
-        log_input = st.text_area("분석할 [Conversation Log] 입력", height=500)
+        user_id   = st.text_input("학습자 ID 입력 후 기억하세요", max_chars=10, value="id")
+        log_input = st.text_area("분석할 [Conversation Log] 입력", height=400)
         analyze_btn = st.button(
-            f"🚀 앙상블 분석 ({ENSEMBLE_N}회 교차 검증)",
+            f"🚀 분석 시작 ({ENSEMBLE_N}회 교차 검증)",
             use_container_width=True
         )
 
