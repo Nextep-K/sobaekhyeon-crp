@@ -20,16 +20,18 @@ st.title("🧠 소백현: CRP 분석 엔진")
 st.markdown("3회 교차 검증을 통해 신뢰도를 높이고 인지 분석 리포트를 생성합니다.")
 st.divider()
 
-INDICATORS = ['MTI', 'REC', 'RECON', 'ORC']   # GPT 채점 4개
-ENSEMBLE_N = 3
-SHEET_NAME = "SKIM_Timeseries"
-KST        = pytz.timezone("Asia/Seoul")
+INDICATORS  = ['MTI', 'REC', 'RECON', 'ORC']
+ENSEMBLE_N  = 3
+SHEET_NAME  = "SKIM_Timeseries"
+KST         = pytz.timezone("Asia/Seoul")
+DIVERGENCE_THRESHOLD = 2.0  # τ_d
 
-tab_analyze, tab_dashboard, tab_inflection, tab4 = st.tabs([
-    "🔬 분석", "📈 시계열 대시보드", "🔍 변곡점 정밀 분석", "📋 CRP info"
+# ─── Tab 3개로 축소 ───
+tab_analyze, tab_inflection, tab_info = st.tabs([
+    "🔬 분석", "🔍 변곡점 정밀 분석", "📋 CRP info"
 ])
 
-with tab4:
+with tab_info:
     components.html(open("landing.html", encoding="utf-8").read(), height=920)
 
 
@@ -57,14 +59,42 @@ def parse_response(text: str) -> tuple[list[float], str, str]:
         raise ValueError(f"지표 {len(INDICATORS)}개 필요, {len(raw_vals)}개만 파싱됨.")
     scores = [normalize_score(float(v)) for v in raw_vals[:len(INDICATORS)]]
 
-    ko_match = re.search(r"\[INSIGHT_KO\](.*?)\[INSIGHT_EN\]", text, re.S | re.I)
-    en_match = re.search(r"\[INSIGHT_EN\](.*?)$",              text, re.S | re.I)
+    ko_match   = re.search(r"\[INSIGHT_KO\](.*?)\[INSIGHT_EN\]", text, re.S | re.I)
+    en_match   = re.search(r"\[INSIGHT_EN\](.*?)$",              text, re.S | re.I)
     insight_ko = ko_match.group(1).strip() if ko_match else ""
     insight_en = en_match.group(1).strip() if en_match else ""
 
     if not insight_ko or not insight_en:
         raise ValueError("INSIGHT_KO 또는 INSIGHT_EN 섹션이 비어 있습니다.")
     return scores, insight_ko, insight_en
+
+
+# ─────────────────────────────────────────────
+# MTI 레이어 불일치 자기진단
+# ─────────────────────────────────────────────
+
+def diagnose_layer_divergence(scores_list: list[list[float]]) -> dict | None:
+    if len(scores_list) < 3:
+        return None
+    l1, l2, l3 = scores_list[0][0], scores_list[1][0], scores_list[2][0]
+    divergence  = max(l1, l2, l3) - min(l1, l2, l3)
+
+    if divergence <= DIVERGENCE_THRESHOLD:
+        return {"divergence": divergence, "flag": False,
+                "type": "-", "message": "레이어 간 편차 정상 범위"}
+
+    if l1 < l2 and l1 < l3:
+        diag_type = "L1 낮음 · L2 높음"
+        message   = "언어 패턴 풀 보완 필요 — 루브릭 Class 기준 재검토 권장"
+    elif l1 > l2 and l3 < l2:
+        diag_type = "L1 높음 · L3 낮음"
+        message   = "명시적 수정은 있으나 구조적 변화 없음 — 표면적 메타인지 가능성"
+    else:
+        diag_type = "L2 낮음 · L3 높음"
+        message   = "암묵적 패턴은 있으나 LLM 판단 미포착 — 루브릭 보정 필요"
+
+    return {"divergence": divergence, "flag": True,
+            "type": diag_type, "message": message}
 
 
 # ─────────────────────────────────────────────
@@ -90,9 +120,7 @@ def get_worksheet(u_id: str):
         ws = ss.worksheet(u_id)
     except gspread.WorksheetNotFound:
         ws = ss.add_worksheet(title=u_id, rows=1000, cols=20)
-        ws.append_row([
-            "timestamp", "MTI", "Rec", "Recon", "Orc", "insight_summary"
-        ])
+        ws.append_row(["timestamp", "MTI", "Rec", "Recon", "Orc", "insight_summary"])
     return ws
 
 
@@ -134,7 +162,6 @@ def _ascii_bar(score: float, width: int = 20) -> str:
 
 
 def _safe(text: str) -> str:
-    """latin1 범위를 벗어난 문자를 제거하여 FPDF1 인코딩 오류 방지"""
     return text.encode("latin1", errors="ignore").decode("latin1")
 
 
@@ -147,7 +174,8 @@ def create_ensemble_pdf(insight_en: str, u_id: str, time: str,
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 12, "Sobaekhyeon CRP Cognitive Report", ln=True, align="C")
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 5, f"ID: {_safe(u_id)}   |   Date: {_safe(time)}   |   Ensemble N={ENSEMBLE_N}",
+    pdf.cell(0, 5,
+             f"ID: {_safe(u_id)}   |   Date: {_safe(time)}   |   Ensemble N={ENSEMBLE_N}",
              ln=True, align="C")
     pdf.ln(4)
     pdf.set_draw_color(180, 180, 180)
@@ -173,7 +201,7 @@ def create_ensemble_pdf(insight_en: str, u_id: str, time: str,
 
     pdf.set_font("Helvetica", "", 8)
     pdf.set_text_color(160, 160, 160)
-    pdf.cell(0, 10, "Sobaekhyeon CRP  |  v5.0  |  Confidential",
+    pdf.cell(0, 10, "Sobaekhyeon CRP  |  v6.1  |  Confidential",
              ln=True, align="C")
 
     pdf_out = pdf.output(dest="S")
@@ -190,18 +218,27 @@ def create_ensemble_pdf(insight_en: str, u_id: str, time: str,
 # ─────────────────────────────────────────────
 
 INDICATOR_GUIDE = {
-    "MTI":   ("사고 전환",  [(1,4,"새로운 시각으로 전환하는 데 조금 어려움이 있어요."),
-                             (4,7,"고정된 틀에서 벗어나려는 시도가 보여요."),
-                             (7,11,"유연하게 관점을 바꾸며 사고하고 있어요.")]),
-    "Rec":   ("재인식",     [(1,4,"기존 지식을 새 맥락에 연결하기 어려워하고 있어요."),
-                             (4,7,"알던 것을 다르게 볼 줄 알지만 아직 깊이가 붙고 있어요."),
-                             (7,11,"경험과 개념을 잘 연결해 재발견하고 있어요.")]),
-    "Recon": ("재구성",     [(1,4,"개념들을 하나의 구조로 엮는 데 연습이 필요해요."),
-                             (4,7,"개념 간 연결 시도가 늘고 있어요."),
-                             (7,11,"여러 개념을 새로운 구조로 능동적으로 재조합하고 있어요.")]),
-    "Orc":   ("인지 조율",  [(1,4,"사고 흐름을 스스로 조절하는 데 어려움이 있어요."),
-                             (4,7,"흐름은 일정하지만 자기 조절이 아직 수동적이에요."),
-                             (7,11,"인지 자원을 전략적으로 배분하며 사고하고 있어요.")]),
+    "MTI": ("사고 전환", [
+        (1,  4,  "AI 출력을 그대로 수용하고 있어요. 사고의 방향이 외부에 의해 결정되고 있습니다."),
+        (4,  7,  "기존 논리를 수정하거나 관점을 바꾸려는 시도가 보여요."),
+        (7,  10, "스스로 사고의 방향을 바꾸고 있어요."),
+        (10, 11, "문제 자체를 재정의하는 수준의 사고 전환이 감지됩니다. (Class A+)")
+    ]),
+    "Rec": ("재인식", [
+        (1, 4,  "기존 지식을 새 맥락에 연결하기 어려워하고 있어요."),
+        (4, 7,  "알던 것을 다르게 볼 줄 알지만 아직 깊이가 붙고 있어요."),
+        (7, 11, "경험과 개념을 잘 연결해 재발견하고 있어요.")
+    ]),
+    "Recon": ("재구성", [
+        (1, 4,  "개념들을 하나의 구조로 엮는 데 연습이 필요해요."),
+        (4, 7,  "개념 간 연결 시도가 늘고 있어요."),
+        (7, 11, "여러 개념을 새로운 구조로 능동적으로 재조합하고 있어요.")
+    ]),
+    "Orc": ("인지 조율", [
+        (1, 4,  "사고 흐름을 스스로 조절하는 데 어려움이 있어요."),
+        (4, 7,  "흐름은 일정하지만 자기 조절이 아직 수동적이에요."),
+        (7, 11, "인지 자원을 전략적으로 배분하며 사고하고 있어요.")
+    ]),
 }
 
 
@@ -220,8 +257,8 @@ with tab_analyze:
 
     with col1:
         st.subheader("👤 학습자 정보")
-        user_id   = st.text_input("학습자 ID", max_chars=10, value="id")
-        log_input = st.text_area("분석할 [Conversation Log] 입력", height=500)
+        user_id     = st.text_input("학습자 ID", max_chars=10, value="id")
+        log_input   = st.text_area("분석할 [Conversation Log] 입력", height=500)
         analyze_btn = st.button(
             f"🚀 분석 시작 ({ENSEMBLE_N}회 교차 검증)",
             use_container_width=True
@@ -261,26 +298,25 @@ with tab_analyze:
 
                                     "--- SCORING RUBRIC ---\n\n"
 
-                                    # MTI (사고 전환 · Meta-cognitive Tension Index)
-                                    # 학습자가 기존 논리를 스스로 수정하거나 관점을 전환하는
-                                    # 메타인지적 역동성을 측정한다.
-                                    # 자기 수정 발화 패턴("아니다","바꿔야겠다","틀렸다" 등),
-                                    # 충돌 후 전환까지 소요된 대화 턴 수, 성찰 발화의 심층도가 기준이다.
                                     "MTI (Meta-cognitive Tension Index):\n"
-                                    "  1-3: No self-correction. Accepts all AI outputs passively. "
-                                    "No negation phrases or strategy revision detected.\n"
-                                    "  4-6: Occasionally uses negation or revision phrases "
-                                    "(e.g. 'that is wrong', 'I need to change this'). "
-                                    "Some strategic adjustment after cognitive conflict, "
-                                    "but transition takes many turns.\n"
-                                    "  7-10: Frequent self-negation and rapid perspective shifts "
-                                    "(within 1-2 turns after conflict). Actively restructures logic. "
-                                    "Deep reflective engagement with explicit reasoning about the change.\n\n"
+                                    "  Class hierarchy (Veenman 2011): A+ > A > B > C.\n"
+                                    "  Upper class structurally subsumes lower. Apply highest class only.\n\n"
+                                    "  1-3 [Class C or none]: No self-correction. "
+                                    "Accepts all AI outputs passively. "
+                                    "No negation or strategy revision detected.\n"
+                                    "  4-6 [Class B-C]: Occasionally revises approach or reflects. "
+                                    "Uses negation or revision phrases but transition takes many turns.\n"
+                                    "  7-9 [Class A]: Frequent self-negation "
+                                    "(e.g. 'I was wrong', 'I need to change this'). "
+                                    "Rapid perspective shifts within 1-2 turns after conflict. "
+                                    "Actively restructures logic with explicit reasoning.\n"
+                                    "  9-10 [Class A+]: Redefines the problem or task premise itself. "
+                                    "Challenges the frame of the question "
+                                    "(e.g. 'This question is wrongly posed', "
+                                    "'I need to redefine the problem'). "
+                                    "Why-layer thinking: questions the validity of the task itself, "
+                                    "not just the answer. Must cite exact learner utterance.\n\n"
 
-                                    # REC (재인식 · Recognition)
-                                    # 대화 흐름 속에서 핵심 패턴과 원리를 식별하는 능력을 측정한다.
-                                    # 단순 키워드 반복이 아닌 개념 간 관계 파악, 구조적 서술,
-                                    # 정보의 중요도를 핵심과 주변부로 분류하는 능력이 기준이다.
                                     "REC (Recognition):\n"
                                     "  1-3: Simple keyword repetition. Cannot distinguish core concepts "
                                     "from peripheral details. No relational understanding.\n"
@@ -291,11 +327,6 @@ with tab_analyze:
                                     "Accurately classifies information by importance. "
                                     "Extracts core principles and maps concept interdependencies independently.\n\n"
 
-                                    # RECON (재구성 · Reconfiguration)
-                                    # 기존 지식을 해체하고 새로운 구조로 통합·재조립하는 역량을 측정한다.
-                                    # AI 제안 수용 대비 수정·재설계 비율, 독창적 대안 제시 여부,
-                                    # 초기 설계안과 최종 산출물 사이의 구조적 차이가 기준이다.
-                                    # Piaget의 조절(Accommodation)이 실제로 일어나고 있는지를 반영한다.
                                     "RECON (Reconfiguration):\n"
                                     "  1-3: Accepts AI output as-is. No restructuring or alternative proposals. "
                                     "Final output is structurally identical to initial framing.\n"
@@ -305,11 +336,6 @@ with tab_analyze:
                                     "Creates new conceptual structures. Final output shows clear structural "
                                     "transformation from initial framing. Original alternatives proposed.\n\n"
 
-                                    # ORC (조율 · Orchestration)
-                                    # AI와 자원을 전략적으로 운용하는 지휘 능력을 측정한다.
-                                    # 프롬프트 정교함, 작업 분해 및 순서화, AI 출력 검증 행동,
-                                    # 자원 배분의 타이밍이 기준이다.
-                                    # Orc가 안정적으로 유지되면 기저 조율 능력 확보의 신호로 해석한다.
                                     "ORC (Orchestration):\n"
                                     "  1-3: Vague, unstructured prompts. No task decomposition. "
                                     "Passive AI use with no verification. Poor timing of resource allocation.\n"
@@ -360,6 +386,20 @@ with tab_analyze:
                         + " | ".join(f"{c}: ±{std[c]:.2f}" for c in ["MTI","Rec","Recon","Orc"])
                     )
 
+                diag = diagnose_layer_divergence(scores_list)
+                if diag:
+                    if diag["flag"]:
+                        st.warning(
+                            f"⚠️ **MTI 레이어 불일치 감지** | "
+                            f"편차: {diag['divergence']:.2f} (τ_d={DIVERGENCE_THRESHOLD})\n\n"
+                            f"**유형:** {diag['type']}\n\n"
+                            f"**진단:** {diag['message']}"
+                        )
+                    else:
+                        st.success(
+                            f"✅ MTI 레이어 편차 정상 ({diag['divergence']:.2f} ≤ {DIVERGENCE_THRESHOLD})"
+                        )
+
                 fig, ax = plt.subplots(figsize=(6, 4))
                 ax.bar(
                     ["MTI","Rec","Recon","Orc"],
@@ -408,76 +448,7 @@ with tab_analyze:
 
 
 # ─────────────────────────────────────────────
-# TAB 2: 시계열 대시보드
-# ─────────────────────────────────────────────
-with tab_dashboard:
-    st.subheader("📈 시계열 대시보드")
-
-    dash_id = st.text_input("조회할 학습자 ID", max_chars=10, value="sj", key="dash_id")
-    hist_df = load_timeseries(dash_id) if dash_id else None
-
-    if hist_df is None or hist_df.empty:
-        st.info("저장된 시계열 데이터가 없습니다. 먼저 분석을 실행하세요.")
-    else:
-        st.caption(
-            f"총 {len(hist_df)}회 분석 기록 | "
-            f"{hist_df['timestamp'].min().date()} ~ {hist_df['timestamp'].max().date()}"
-        )
-
-        st.markdown("#### 📉 인지 성장 추이 (Orc · MTI)")
-        fig2, ax2 = plt.subplots(figsize=(8, 3.5))
-        ax2.plot(hist_df["timestamp"], hist_df["Orc"],
-                 marker="o", label="Orc", color="#e74c3c")
-        ax2.plot(hist_df["timestamp"], hist_df["MTI"],
-                 marker="s", label="MTI", color="#3498db", linestyle="--")
-        ax2.set_ylim(0, 10)
-        ax2.set_xlabel("날짜")
-        ax2.set_ylabel("점수")
-        ax2.legend()
-        ax2.tick_params(axis="x", rotation=30)
-        st.pyplot(fig2)
-        plt.close(fig2)
-
-        st.markdown("#### 🔍 패턴 감지 (Orc 기준 급변 구간)")
-        if len(hist_df) >= 2:
-            hist_df["orc_delta"] = hist_df["Orc"].diff().abs()
-            threshold = hist_df["orc_delta"].mean() + hist_df["orc_delta"].std()
-            spikes    = hist_df[hist_df["orc_delta"] > threshold]
-
-            if spikes.empty:
-                st.success("급변 구간 없음 — 안정적인 성장 패턴입니다.")
-            else:
-                for _, row in spikes.iterrows():
-                    prev_orc  = hist_df.loc[row.name - 1, "Orc"] if row.name > 0 else row["Orc"]
-                    direction = "📈 급상승" if row["Orc"] > prev_orc else "📉 급하락"
-                    st.warning(
-                        f"{direction} | {row['timestamp'].strftime('%Y-%m-%d %H:%M')} | "
-                        f"Orc 변화량: ±{row['orc_delta']:.2f} | "
-                        f"해설 요약: {row['insight_summary']}"
-                    )
-        else:
-            st.info("패턴 분석은 2회 이상 데이터 필요합니다.")
-
-        st.markdown("#### 🗂️ 분석 히스토리")
-        display_cols = ["timestamp","MTI","Rec","Recon","Orc","insight_summary"]
-        st.dataframe(
-            hist_df[display_cols].rename(columns={
-                "timestamp": "분석 일시", "insight_summary": "해설 요약"
-            }),
-            use_container_width=True
-        )
-
-        csv_bytes = hist_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        st.download_button(
-            label="⬇️ 시계열 데이터 CSV 다운로드",
-            data=csv_bytes,
-            file_name=f"CRP_history_{dash_id}.csv",
-            mime="text/csv"
-        )
-
-
-# ─────────────────────────────────────────────
-# TAB 3: 변곡점 정밀 분석 (Grokking — 시스템 계산)
+# TAB 2: 변곡점 정밀 분석 + 히스토리 테이블 + CSV
 # ─────────────────────────────────────────────
 with tab_inflection:
     st.subheader("🔍 Cognitive Inflection Point Analysis")
@@ -486,22 +457,29 @@ with tab_inflection:
 
     if inflect_btn and inflect_id:
         data = load_timeseries(inflect_id)
-        if data is not None and len(data) >= 2:
+
+        if data is None or data.empty:
+            st.info("No data found. Please run analysis first.")
+
+        elif len(data) < 2:
+            st.info(f"Minimum 2 sessions required. (Current: {len(data)})")
+
+        else:
             core_metrics = ["MTI", "Rec", "Recon", "Orc"]
             colors       = ["#9b59b6", "#3498db", "#e74c3c", "#2ecc71"]
 
+            # ── 4지표 시계열 그래프 ──
             fig3, ax3 = plt.subplots(figsize=(11, 5))
             for metric, color in zip(core_metrics, colors):
                 ax3.plot(data["timestamp"], data[metric],
                          marker="o", label=metric, color=color, alpha=0.6, linewidth=1.5)
 
-            # Grokking: velocity 기반 시스템 계산
             data["momentum"]     = data[core_metrics].mean(axis=1)
             data["velocity"]     = data["momentum"].diff()
             data["acceleration"] = data["velocity"].diff()
 
-            v_std     = data["velocity"].std()
-            threshold = v_std * 1.2 if v_std > 0 else 0.5
+            v_std       = data["velocity"].std()
+            threshold   = v_std * 1.2 if v_std > 0 else 0.5
             inflections = data[data["velocity"].abs() > threshold]
 
             for _, row in inflections.iterrows():
@@ -523,6 +501,7 @@ with tab_inflection:
             st.pyplot(fig3)
             plt.close(fig3)
 
+            # ── Cognitive Momentum ──
             st.markdown("#### 📊 Cognitive Momentum")
             fig4, ax4 = plt.subplots(figsize=(11, 2.5))
             ax4.fill_between(data["timestamp"], data["momentum"], alpha=0.3, color="#3498db")
@@ -533,6 +512,7 @@ with tab_inflection:
             st.pyplot(fig4)
             plt.close(fig4)
 
+            # ── 변곡점 상세 ──
             st.markdown("#### 🚩 Analysis Details")
             if not inflections.empty:
                 for _, row in inflections.iterrows():
@@ -543,8 +523,9 @@ with tab_inflection:
                     ):
                         col_a, col_b = st.columns([1, 4])
                         col_a.metric("Velocity",     f"{row['velocity']:+.2f}")
-                        col_a.metric("Acceleration", f"{row['acceleration']:+.2f}"
-                                     if pd.notna(row['acceleration']) else "N/A")
+                        col_a.metric("Acceleration",
+                                     f"{row['acceleration']:+.2f}"
+                                     if pd.notna(row["acceleration"]) else "N/A")
                         col_b.write(f"**Insight Summary:** {row['insight_summary']}")
 
                     with st.spinner("AI 심층 분석 중..."):
@@ -573,14 +554,33 @@ with tab_inflection:
                                 temperature=0.3,
                                 max_tokens=500
                             )
-                            st.markdown(f"**🧠 AI 심층 분석**\n\n{res.choices[0].message.content.strip()}")
+                            st.markdown(
+                                f"**🧠 AI 심층 분석**\n\n"
+                                f"{res.choices[0].message.content.strip()}"
+                            )
                             st.divider()
                         except Exception as e:
                             st.warning(f"분석 오류: {e}")
             else:
                 st.info("No significant inflection points detected in current interval.")
 
-        elif data is not None and len(data) < 2:
-            st.info(f"Minimum 2 sessions required. (Current: {len(data)})")
-        else:
-            st.info("No data found. Please run analysis first.")
+            # ── 히스토리 테이블 + CSV (Tab2에서 이전) ──
+            st.markdown("#### 🗂️ 분석 히스토리")
+            st.caption(
+                f"총 {len(data)}회 분석 기록 | "
+                f"{data['timestamp'].min().date()} ~ {data['timestamp'].max().date()}"
+            )
+            display_cols = ["timestamp","MTI","Rec","Recon","Orc","insight_summary"]
+            st.dataframe(
+                data[display_cols].rename(columns={
+                    "timestamp": "분석 일시", "insight_summary": "해설 요약"
+                }),
+                use_container_width=True
+            )
+            csv_bytes = data.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                label="⬇️ 시계열 데이터 CSV 다운로드",
+                data=csv_bytes,
+                file_name=f"CRP_history_{inflect_id}.csv",
+                mime="text/csv"
+            )
