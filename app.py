@@ -119,8 +119,12 @@ def get_worksheet(u_id: str):
     try:
         ws = ss.worksheet(u_id)
     except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=u_id, rows=1000, cols=20)
-        ws.append_row(["timestamp", "MTI", "Rec", "Recon", "Orc", "insight_summary"])
+        try:
+            ws = ss.add_worksheet(title=u_id, rows=1000, cols=20)
+            ws.append_row(["timestamp", "MTI", "Rec", "Recon", "Orc", "insight_summary"])
+        except Exception:
+            # 동시 생성 또는 이미 존재하는 경우 재시도
+            ws = ss.worksheet(u_id)
     return ws
 
 
@@ -479,8 +483,17 @@ with tab_inflection:
             data["acceleration"] = data["velocity"].diff()
 
             v_std       = data["velocity"].std()
-            threshold   = v_std * 1.2 if v_std > 0 else 0.5
-            inflections = data[data["velocity"].abs() > threshold]
+            # 최소 임계값 1.0 하한선 — 세션 수 적거나 점수 밀집 시 과탐지 방지
+            threshold   = max(v_std * 1.2 if v_std > 0 else 0.5, 1.0)
+            # 최소 5세션 미만이면 변곡점 탐지 보류
+            if len(data) < 5:
+                st.info(
+                    f"📊 현재 {len(data)}회 세션 — 변곡점 탐지는 5회 이상 누적 후 신뢰도가 높아집니다. "
+                    "데이터를 계속 축적하세요."
+                )
+                inflections = data.iloc[0:0]  # 빈 DataFrame
+            else:
+                inflections = data[data["velocity"].abs() > threshold]
 
             for _, row in inflections.iterrows():
                 if row["velocity"] > 0:
