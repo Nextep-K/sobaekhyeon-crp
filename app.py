@@ -634,46 +634,82 @@ with tab_inflection:
                                 for m in ["MTI", "Rec", "Recon", "Orc"]
                             )
 
-                            # ── [v6.3] 시스템 프롬프트 — 분석 규칙 4개 ───
+                            # ── [v6.4] 지표 의미 레이블 매핑 ─────────────
+                            METRIC_LABELS = {
+                                "MTI":   "스스로 틀렸음을 인식하고 사고를 전환하는 능력",
+                                "Rec":   "새로운 맥락에서 개념을 재인식하는 능력",
+                                "Recon": "개념들을 새 구조로 재조립하는 능력",
+                                "Orc":   "사고 흐름을 전략적으로 조율하는 능력",
+                            }
+
+                            max_m = diff["max_drop_metric"]
+                            min_m = diff["min_drop_metric"]
+
+                            # ── [v6.4] 시스템 프롬프트 — 궤적 언어 6개 규칙 ─
                             system_prompt = (
-                                "당신은 CRP 인지 변곡점 분석기입니다. "
+                                "당신은 CRP(Cognitive Re-configuration Protocol) "
+                                "인지 궤적 분석기입니다. "
                                 "다음 규칙을 반드시 지키십시오.\n\n"
-                                "규칙 1: 분석 단위는 delta 비대칭입니다. "
-                                "지표별 변화폭 차이가 핵심이며, "
-                                "'모든 지표가 동일하게 변화'는 분석이 아닙니다.\n\n"
-                                "규칙 2: MTI는 trait(인지 성향) 지표입니다. "
-                                "Veenman(2006)/Sweller(1988)에 따라 피로·부하는 "
-                                "Recon/Rec/Orc(object-level)를 먼저 소진하고 "
-                                "MTI(meta-level 감시 회로)는 상대적으로 유지됩니다. "
-                                "MTI delta가 다른 지표와 다른 패턴을 보이면 명시적으로 반영하십시오.\n\n"
-                                "규칙 3: 다음 4개 유형 중 하나를 반드시 출력하십시오: "
-                                "확산집중형 / 균형성장형 / 실행편중형 / 인지포화형\n\n"
-                                "규칙 4: '가능성이 있습니다' 형태의 미확정 서술 금지. "
-                                "출력 구조: [delta 근거] → [판단] → [분류] → [처방]"
+
+                                "규칙 1 — 궤적 서술: "
+                                "출력은 현재 상태 판정이 아닌 변화 과정 서술이어야 합니다.\n"
+                                "  ✗ '재조립 능력이 저하된 상태입니다'\n"
+                                "  ✓ '재조립 능력이 가장 빠르게 하락하며 다른 능력과 격차가 벌어졌습니다'\n\n"
+
+                                "규칙 2 — 비대칭 분석: "
+                                "지표별 변화폭 차이가 분석 핵심입니다. "
+                                "'모든 능력이 동일하게 변화했다'는 서술은 분석이 아닙니다.\n\n"
+
+                                "규칙 3 — 사고 전환 능력의 안정성: "
+                                "Veenman(2006)/Sweller(1988)에 따라 인지 부하·피로는 "
+                                "실행 수준 능력(재인식·재조립·조율)을 먼저 떨어뜨리고, "
+                                "메타 수준인 '스스로 틀렸음을 인식하는 능력'은 상대적으로 유지됩니다. "
+                                "이 패턴이 데이터에 나타나면 명시적으로 서술하십시오.\n\n"
+
+                                "규칙 4 — 분류 필수: "
+                                "확산집중형 / 균형성장형 / 실행편중형 / 인지포화형 "
+                                "중 하나를 반드시 출력하십시오.\n\n"
+
+                                "규칙 5 — 지표 약어 금지: "
+                                "MTI, Rec, Recon, Orc를 출력에 직접 쓰지 마십시오. "
+                                "각 능력의 의미를 동사·명사로 풀어 쓰십시오.\n\n"
+
+                                "규칙 6 — 헤징 금지: "
+                                "'가능성이 있습니다' 형태의 미확정 서술을 사용하지 마십시오. "
+                                "출력 구조: [변화 서술] → [패턴 판단] → [분류] → [다음 방향]"
                             )
 
-                            # ── [v6.3] 유저 프롬프트 — STEP 구조 ──────────
+                            # ── [v6.4] 유저 프롬프트 — 궤적 중심 STEP ──────
                             prompt = (
-                                f"[CRP 변곡점 분석 — {inflect_id} / 세션 {row.name+1} / {tag}]\n\n"
-                                f"기준점: {baseline_str}\n"
-                                f"현재값: {current_str}\n"
-                                f"delta:  {delta_str}\n"
-                                f"평균 delta: {diff['avg_delta']:+.2f}\n"
-                                f"MTI trait: {mti_stable_label}\n"
+                                f"[CRP 인지 궤적 분석 — {inflect_id} / 세션 {row.name+1} / {tag}]\n\n"
+                                f"기준점(peak): {baseline_str}\n"
+                                f"현재값:       {current_str}\n"
+                                f"변화량(delta): {delta_str}\n"
+                                f"평균 변화량:  {diff['avg_delta']:+.2f}\n"
+                                f"사고 전환 능력 변화: {mti_stable_label}\n"
                                 f"사전 분류 힌트: {diff['class_hint']}\n\n"
-                                f"STEP 1 — {extreme_metric_label[0]}: "
-                                f"{diff['max_drop_metric']}({diff['deltas'][diff['max_drop_metric']]:+.2f}), "
-                                f"{extreme_metric_label[1]}: "
-                                f"{diff['min_drop_metric']}({diff['deltas'][diff['min_drop_metric']]:+.2f}). "
-                                f"이 {direction_word} 비대칭이 무엇을 의미하는지 수치를 인용해 1문장으로 서술하십시오.\n\n"
-                                f"STEP 2 — MTI delta({diff['deltas']['MTI']:+.2f})를 "
-                                f"평균 delta({diff['avg_delta']:+.2f})와 비교하여 "
-                                f"인지 성향 변화인지 수행 자원 소진(또는 회복)인지 판별하십시오.\n\n"
-                                f"STEP 3 — 힌트({diff['class_hint']})를 검토하고 "
-                                f"STEP 1·2 근거로 최종 분류를 확정하십시오.\n\n"
-                                f"STEP 4 — '무엇을 줄이거나 추가하라' 형태로 "
-                                f"처방을 1문장으로 서술하십시오.\n\n"
-                                f"전체 150자 이내로 작성하십시오."
+
+                                f"STEP 1 — 변화 속도 비교\n"
+                                f"  '{METRIC_LABELS[max_m]}'이(가) {diff['deltas'][max_m]:+.2f}로 "
+                                f"가장 {'빠르게 하락' if is_pivot else '크게 상승'}했고, "
+                                f"'{METRIC_LABELS[min_m]}'은(는) {diff['deltas'][min_m]:+.2f}로 "
+                                f"상대적으로 {'덜 하락' if is_pivot else '덜 상승'}했습니다.\n"
+                                f"이 두 능력의 변화 속도 차이가 무엇을 나타내는지 1문장으로 서술하십시오.\n\n"
+
+                                f"STEP 2 — 무엇이 버텼고 무엇이 먼저 꺾였는가\n"
+                                f"  '스스로 틀렸음을 인식하고 사고를 전환하는 능력'의 변화({diff['deltas']['MTI']:+.2f})가 "
+                                f"평균 변화({diff['avg_delta']:+.2f})보다 {'작습니다' if diff['mti_trait_stable'] else '큽니다'}.\n"
+                                f"다른 능력들이 변하는 동안 이 능력이 어떤 양상을 보였는지 1문장으로 서술하십시오.\n\n"
+
+                                f"STEP 3 — 이 변화 패턴이 나타내는 인지 전환\n"
+                                f"  분류 힌트({diff['class_hint']})를 검토하고, "
+                                f"STEP 1·2의 변화 흐름 근거로 최종 분류를 확정하십시오.\n\n"
+
+                                f"STEP 4 — 다음 변화를 위한 방향\n"
+                                f"  이 변화 흐름이 계속된다면 어떤 방향으로 이어질지, "
+                                f"그리고 다음 세션에서 어디서부터 시작하면 좋을지 1문장으로 서술하십시오.\n\n"
+
+                                f"전체 200자 이내로 작성하십시오."
                             )
 
                             res = client.chat.completions.create(
