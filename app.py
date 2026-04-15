@@ -98,6 +98,59 @@ def diagnose_layer_divergence(scores_list: list[list[float]]) -> dict | None:
 
 
 # ─────────────────────────────────────────────
+# [v6.3 추가] 변곡점 delta 사전 계산
+# ─────────────────────────────────────────────
+
+def compute_pivot_differential(data: pd.DataFrame, pivot_row: pd.Series) -> dict:
+    """
+    변곡점 행을 기준으로 delta·낙폭 순위·MTI trait 안정 여부를 사전 계산.
+    LLM에게 수치 해석을 위임하지 않고 구조화된 근거로 입력한다.
+    """
+    metrics = ["MTI", "Rec", "Recon", "Orc"]
+
+    prior = data[data["timestamp"] < pivot_row["timestamp"]]
+    if prior.empty:
+        baseline = {m: float(pivot_row[m]) for m in metrics}
+    else:
+        peak_idx = prior["momentum"].idxmax() if "momentum" in prior.columns else prior.index[-1]
+        baseline = {m: float(prior.loc[peak_idx, m]) for m in metrics}
+
+    current = {m: float(pivot_row[m]) for m in metrics}
+    deltas  = {m: round(current[m] - baseline[m], 2) for m in metrics}
+
+    sorted_by_drop = sorted(metrics, key=lambda m: deltas[m])
+    delta_ranks    = {m: sorted_by_drop.index(m) + 1 for m in metrics}
+    avg_delta      = round(sum(deltas.values()) / len(metrics), 2)
+    mti_trait_stable = deltas["MTI"] > avg_delta
+
+    mti_v, recon_v, orc_v, rec_v = (
+        current["MTI"], current["Recon"], current["Orc"], current["Rec"]
+    )
+    if mti_v >= 6.5 and recon_v < 6.0:
+        class_hint = "확산집중형"
+    elif orc_v >= 7.0 and rec_v >= 7.0 and mti_v < 6.5:
+        class_hint = "실행편중형"
+    elif mti_trait_stable and deltas["Recon"] < -2.0:
+        class_hint = "인지포화형"
+    elif max(current.values()) - min(current.values()) < 1.5:
+        class_hint = "균형성장형"
+    else:
+        class_hint = "판단보류"
+
+    return {
+        "current":          current,
+        "baseline":         baseline,
+        "deltas":           deltas,
+        "delta_ranks":      delta_ranks,
+        "avg_delta":        avg_delta,
+        "mti_trait_stable": mti_trait_stable,
+        "max_drop_metric":  sorted_by_drop[0],
+        "min_drop_metric":  sorted_by_drop[-1],
+        "class_hint":       class_hint,
+    }
+
+
+# ─────────────────────────────────────────────
 # Google Sheets
 # ─────────────────────────────────────────────
 
@@ -543,29 +596,94 @@ with tab_inflection:
 
                     with st.spinner("AI 심층 분석 중..."):
                         try:
-                            session_series = "\n".join([
-                                f"세션 {i+1} ({r['timestamp'].strftime('%m/%d %H:%M')}): "
-                                f"MTI {r['MTI']:.2f} / Rec {r['Rec']:.2f} / "
-                                f"Recon {r['Recon']:.2f} / Orc {r['Orc']:.2f}"
-                                for i, r in data.iterrows()
-                            ])
-                            prompt = f"""
-아래는 학습자 {inflect_id}의 전체 세션 인지 수치 흐름이다.
-변곡점 위치를 기준으로, 전후 수치 변화를 학습자의 '인지 전략' 관점에서 3~5문장으로 해설하라.
-대학생이 이해할 수 있는 한국어로 써라.
-데이터가 {len(data)}회차임을 감안하여 단정보다 가능성으로 표현하라.
+                            # ── [v6.3] delta 사전 계산 ──────────────────────
+                            diff = compute_pivot_differential(data, row)
+                            is_pivot = row["velocity"] < 0  # PIVOT=낙폭분석 / JUMP=상승분석
 
-[전체 수치 흐름]
-{session_series}
+                            # PIVOT: 낙폭 순위 라벨 / JUMP: 상승폭 순위 라벨
+                            if is_pivot:
+                                extreme_label = {1: "(↓최대)", 4: "(↓최소)"}
+                                extreme_metric_label = ("낙폭 최대", "낙폭 최소")
+                                direction_word = "낙폭"
+                                mti_stable_label = (
+                                    "YES — MTI 낙폭이 평균보다 작음 (trait 안정)"
+                                    if diff["mti_trait_stable"]
+                                    else "NO — MTI도 평균 이상 하락"
+                                )
+                            else:
+                                extreme_label = {4: "(↑최대)", 1: "(↑최소)"}
+                                extreme_metric_label = ("상승폭 최대", "상승폭 최소")
+                                direction_word = "변화폭"
+                                mti_stable_label = (
+                                    "YES — MTI 상승폭이 평균 이상"
+                                    if not diff["mti_trait_stable"]
+                                    else "YES — MTI 상승폭이 평균보다 작음"
+                                )
 
-변곡점: 세션 {row.name+1} ({row['timestamp'].strftime('%m/%d %H:%M')})
-유형: {tag} / Velocity: {row['velocity']:+.2f}
-"""
+                            delta_str = "  ".join(
+                                f"{m}: {diff['deltas'][m]:+.2f}"
+                                + extreme_label.get(diff["delta_ranks"][m], "")
+                                for m in ["MTI", "Rec", "Recon", "Orc"]
+                            )
+                            baseline_str = "  ".join(
+                                f"{m}: {diff['baseline'][m]:.2f}"
+                                for m in ["MTI", "Rec", "Recon", "Orc"]
+                            )
+                            current_str = "  ".join(
+                                f"{m}: {diff['current'][m]:.2f}"
+                                for m in ["MTI", "Rec", "Recon", "Orc"]
+                            )
+
+                            # ── [v6.3] 시스템 프롬프트 — 분석 규칙 4개 ───
+                            system_prompt = (
+                                "당신은 CRP 인지 변곡점 분석기입니다. "
+                                "다음 규칙을 반드시 지키십시오.\n\n"
+                                "규칙 1: 분석 단위는 delta 비대칭입니다. "
+                                "지표별 변화폭 차이가 핵심이며, "
+                                "'모든 지표가 동일하게 변화'는 분석이 아닙니다.\n\n"
+                                "규칙 2: MTI는 trait(인지 성향) 지표입니다. "
+                                "Veenman(2006)/Sweller(1988)에 따라 피로·부하는 "
+                                "Recon/Rec/Orc(object-level)를 먼저 소진하고 "
+                                "MTI(meta-level 감시 회로)는 상대적으로 유지됩니다. "
+                                "MTI delta가 다른 지표와 다른 패턴을 보이면 명시적으로 반영하십시오.\n\n"
+                                "규칙 3: 다음 4개 유형 중 하나를 반드시 출력하십시오: "
+                                "확산집중형 / 균형성장형 / 실행편중형 / 인지포화형\n\n"
+                                "규칙 4: '가능성이 있습니다' 형태의 미확정 서술 금지. "
+                                "출력 구조: [delta 근거] → [판단] → [분류] → [처방]"
+                            )
+
+                            # ── [v6.3] 유저 프롬프트 — STEP 구조 ──────────
+                            prompt = (
+                                f"[CRP 변곡점 분석 — {inflect_id} / 세션 {row.name+1} / {tag}]\n\n"
+                                f"기준점: {baseline_str}\n"
+                                f"현재값: {current_str}\n"
+                                f"delta:  {delta_str}\n"
+                                f"평균 delta: {diff['avg_delta']:+.2f}\n"
+                                f"MTI trait: {mti_stable_label}\n"
+                                f"사전 분류 힌트: {diff['class_hint']}\n\n"
+                                f"STEP 1 — {extreme_metric_label[0]}: "
+                                f"{diff['max_drop_metric']}({diff['deltas'][diff['max_drop_metric']]:+.2f}), "
+                                f"{extreme_metric_label[1]}: "
+                                f"{diff['min_drop_metric']}({diff['deltas'][diff['min_drop_metric']]:+.2f}). "
+                                f"이 {direction_word} 비대칭이 무엇을 의미하는지 수치를 인용해 1문장으로 서술하십시오.\n\n"
+                                f"STEP 2 — MTI delta({diff['deltas']['MTI']:+.2f})를 "
+                                f"평균 delta({diff['avg_delta']:+.2f})와 비교하여 "
+                                f"인지 성향 변화인지 수행 자원 소진(또는 회복)인지 판별하십시오.\n\n"
+                                f"STEP 3 — 힌트({diff['class_hint']})를 검토하고 "
+                                f"STEP 1·2 근거로 최종 분류를 확정하십시오.\n\n"
+                                f"STEP 4 — '무엇을 줄이거나 추가하라' 형태로 "
+                                f"처방을 1문장으로 서술하십시오.\n\n"
+                                f"전체 150자 이내로 작성하십시오."
+                            )
+
                             res = client.chat.completions.create(
                                 model="gpt-4o",
-                                messages=[{"role": "user", "content": prompt}],
-                                temperature=0.3,
-                                max_tokens=500
+                                messages=[
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user",   "content": prompt}
+                                ],
+                                temperature=0.1,   # 0.3 → 0.1
+                                max_tokens=300     # 500 → 300
                             )
                             st.markdown(
                                 f"**🧠 AI 심층 분석**\n\n"
