@@ -112,8 +112,11 @@ def compute_pivot_differential(data: pd.DataFrame, pivot_row: pd.Series) -> dict
     if prior.empty:
         baseline = {m: float(pivot_row[m]) for m in metrics}
     else:
-        peak_idx = prior["momentum"].idxmax() if "momentum" in prior.columns else prior.index[-1]
-        baseline = {m: float(prior.loc[peak_idx, m]) for m in metrics}
+        # velocity = momentum[t] - momentum[t-1] (직전 세션 기준)
+        # delta 기준도 직전 세션으로 통일해야 방향이 일치함
+        # peak 기준을 쓰면 JUMP 직전에 고점이 있을 때 delta가 0/-로 역전됨
+        prev_row = prior.iloc[-1]
+        baseline = {m: float(prev_row[m]) for m in metrics}
 
     current = {m: float(pivot_row[m]) for m in metrics}
     deltas  = {m: round(current[m] - baseline[m], 2) for m in metrics}
