@@ -581,10 +581,16 @@ with tab_inflection:
             st.pyplot(fig4)
             plt.close(fig4)
 
-            # ── 변곡점 상세 ──
+            # ── 변곡점 상세 — 최근 2개만 표시 ──
             st.markdown("#### 🚩 Analysis Details")
             if not inflections.empty:
-                for _, row in inflections.iterrows():
+                # 차트에는 전체 변곡점 표시, 상세 분석은 최근 2개만
+                inflections_display = inflections.tail(2)
+                if len(inflections) > 2:
+                    st.caption(
+                        f"전체 {len(inflections)}개 변곡점 중 최근 2개만 표시됩니다."
+                    )
+                for _, row in inflections_display.iterrows():
                     tag = "Growth" if row["velocity"] > 0 else "Adjustment"
                     with st.expander(
                         f"[{tag}] {row['timestamp'].strftime('%m/%d %H:%M')} "
@@ -678,8 +684,12 @@ with tab_inflection:
                                 "각 능력의 의미를 동사·명사로 풀어 쓰십시오.\n\n"
 
                                 "규칙 6 — 헤징 금지: "
-                                "'가능성이 있습니다' 형태의 미확정 서술을 사용하지 마십시오. "
-                                "출력 구조: [변화 서술] → [패턴 판단] → [분류] → [다음 방향]"
+                                "'가능성이 있습니다' 형태의 미확정 서술을 사용하지 마십시오.\n\n"
+
+                                "규칙 7 — 창작 금지: "
+                                "수치에 없는 내용을 추가하지 마십시오. "
+                                "금지 표현 예시: '~을 촉진했습니다', '조화롭게 발전', '~해야 합니다', '~하는 것이 좋습니다'. "
+                                "출력은 오직 제공된 delta·분류 힌트·수치에서 읽히는 사실만으로 구성하십시오."
                             )
 
                             # ── [v6.4] JUMP/PIVOT 방향에 맞게 주요 지표 선택 ─
@@ -703,40 +713,38 @@ with tab_inflection:
                                 step2_label = "무엇이 함께 올랐고 무엇이 덜 반응했는가"
                                 step2_mti_desc = (
                                     f"다른 능력들이 상승하는 동안 "
-                                    f"{'평균보다 덜 상승하며 상대적으로 낮은 반응을 보였습니다' if diff['mti_trait_stable'] else '평균 이상으로 함께 상승했습니다'}."
+                                    f"{'평균 이상으로 함께 상승했습니다' if diff['mti_trait_stable'] else '평균보다 덜 상승하며 상대적으로 낮은 반응을 보였습니다'}."
                                 )
 
-                            # ── [v6.4] 유저 프롬프트 — 궤적 중심 STEP ──────
+                            # ── [v6.7] 유저 프롬프트 — 관찰 사실만, 창작 차단 ──
                             prompt = (
                                 f"[CRP 인지 궤적 분석 — {inflect_id} / 세션 {row.name+1} / {tag}]\n\n"
-                                f"기준점(peak): {baseline_str}\n"
+                                f"기준점(직전): {baseline_str}\n"
                                 f"현재값:       {current_str}\n"
                                 f"변화량(delta): {delta_str}\n"
                                 f"평균 변화량:  {diff['avg_delta']:+.2f}\n"
                                 f"사고 전환 능력 변화: {mti_stable_label}\n"
                                 f"사전 분류 힌트: {diff['class_hint']}\n\n"
 
-                                f"STEP 1 — 변화 속도 비교\n"
-                                f"  '{METRIC_LABELS[primary_m]}'이(가) {diff['deltas'][primary_m]:+.2f}로 "
-                                f"{primary_verb}했고, "
-                                f"'{METRIC_LABELS[secondary_m]}'은(는) {diff['deltas'][secondary_m]:+.2f}로 "
-                                f"{secondary_verb}했습니다.\n"
-                                f"이 두 능력의 변화 속도 차이가 무엇을 나타내는지 1문장으로 서술하십시오.\n\n"
+                                f"다음 4문장만 순서대로 작성하십시오. "
+                                f"각 문장은 위 수치에서 직접 읽히는 사실만 서술합니다. "
+                                f"수치에 없는 인과관계·가치 판단·권고를 추가하지 마십시오.\n\n"
 
-                                f"STEP 2 — {step2_label}\n"
-                                f"  '스스로 틀렸음을 인식하고 사고를 전환하는 능력'({diff['deltas']['MTI']:+.2f})이 "
-                                f"{step2_mti_desc}\n"
-                                f"이 능력이 이번 변화에서 어떤 역할을 했는지 1문장으로 서술하십시오.\n\n"
+                                f"문장 1: '{METRIC_LABELS[primary_m]}'이(가) {diff['deltas'][primary_m]:+.2f}로 "
+                                f"{primary_verb}했고, '{METRIC_LABELS[secondary_m]}'은(는) "
+                                f"{diff['deltas'][secondary_m]:+.2f}로 {secondary_verb}했습니다. "
+                                f"이 두 수치의 차이({abs(diff['deltas'][primary_m]-diff['deltas'][secondary_m]):.2f})가 무엇을 나타내는지 서술하십시오.\n\n"
 
-                                f"STEP 3 — 이 변화 패턴이 나타내는 인지 전환\n"
-                                f"  분류 힌트({diff['class_hint']})를 검토하고, "
-                                f"STEP 1·2의 변화 흐름 근거로 최종 분류를 확정하십시오.\n\n"
+                                f"문장 2: '스스로 틀렸음을 인식하고 사고를 전환하는 능력'({diff['deltas']['MTI']:+.2f})이 "
+                                f"{step2_mti_desc} 이 수치적 사실을 한 문장으로 서술하십시오.\n\n"
 
-                                f"STEP 4 — 다음 변화를 위한 방향\n"
-                                f"  이 변화 흐름이 계속된다면 어떤 방향으로 이어질지, "
-                                f"그리고 다음 세션에서 어디서부터 시작하면 좋을지 1문장으로 서술하십시오.\n\n"
+                                f"문장 3: 위 수치 패턴을 근거로 분류({diff['class_hint']})를 확정하고 "
+                                f"그 근거를 한 문장으로 서술하십시오.\n\n"
 
-                                f"전체 200자 이내로 작성하십시오."
+                                f"문장 4: 이 변화 흐름에서 관찰되는 사실 하나를 추가로 서술하십시오. "
+                                f"판단·권고·예측은 쓰지 마십시오.\n\n"
+
+                                f"총 4문장. 문장 번호 없이 연결해서 출력하십시오."
                             )
 
                             res = client.chat.completions.create(
