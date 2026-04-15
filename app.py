@@ -679,6 +679,30 @@ with tab_inflection:
                                 "출력 구조: [변화 서술] → [패턴 판단] → [분류] → [다음 방향]"
                             )
 
+                            # ── [v6.4] JUMP/PIVOT 방향에 맞게 주요 지표 선택 ─
+                            # PIVOT: 가장 많이 떨어진(sorted[0]) vs 가장 덜 떨어진(sorted[-1])
+                            # JUMP:  가장 많이 오른(sorted[-1]) vs 가장 덜 오른(sorted[0])
+                            if is_pivot:
+                                primary_m   = max_m   # sorted_by_drop[0] = 최대 낙폭
+                                secondary_m = min_m   # sorted_by_drop[-1] = 최소 낙폭
+                                primary_verb   = "가장 빠르게 하락"
+                                secondary_verb = "상대적으로 덜 하락"
+                                step2_label = "무엇이 버텼고 무엇이 먼저 꺾였는가"
+                                step2_mti_desc = (
+                                    f"인지 부하 상황에서도 "
+                                    f"{'평균보다 덜 하락하며 안정성을 유지했습니다' if diff['mti_trait_stable'] else '평균 이상으로 하락했습니다'}."
+                                )
+                            else:
+                                primary_m   = min_m   # sorted_by_drop[-1] = 최대 상승폭
+                                secondary_m = max_m   # sorted_by_drop[0]  = 최소 상승폭
+                                primary_verb   = "가장 크게 상승"
+                                secondary_verb = "상대적으로 덜 상승"
+                                step2_label = "무엇이 함께 올랐고 무엇이 덜 반응했는가"
+                                step2_mti_desc = (
+                                    f"다른 능력들이 상승하는 동안 "
+                                    f"{'평균보다 덜 상승하며 상대적으로 낮은 반응을 보였습니다' if diff['mti_trait_stable'] else '평균 이상으로 함께 상승했습니다'}."
+                                )
+
                             # ── [v6.4] 유저 프롬프트 — 궤적 중심 STEP ──────
                             prompt = (
                                 f"[CRP 인지 궤적 분석 — {inflect_id} / 세션 {row.name+1} / {tag}]\n\n"
@@ -690,16 +714,16 @@ with tab_inflection:
                                 f"사전 분류 힌트: {diff['class_hint']}\n\n"
 
                                 f"STEP 1 — 변화 속도 비교\n"
-                                f"  '{METRIC_LABELS[max_m]}'이(가) {diff['deltas'][max_m]:+.2f}로 "
-                                f"가장 {'빠르게 하락' if is_pivot else '크게 상승'}했고, "
-                                f"'{METRIC_LABELS[min_m]}'은(는) {diff['deltas'][min_m]:+.2f}로 "
-                                f"상대적으로 {'덜 하락' if is_pivot else '덜 상승'}했습니다.\n"
+                                f"  '{METRIC_LABELS[primary_m]}'이(가) {diff['deltas'][primary_m]:+.2f}로 "
+                                f"{primary_verb}했고, "
+                                f"'{METRIC_LABELS[secondary_m]}'은(는) {diff['deltas'][secondary_m]:+.2f}로 "
+                                f"{secondary_verb}했습니다.\n"
                                 f"이 두 능력의 변화 속도 차이가 무엇을 나타내는지 1문장으로 서술하십시오.\n\n"
 
-                                f"STEP 2 — 무엇이 버텼고 무엇이 먼저 꺾였는가\n"
-                                f"  '스스로 틀렸음을 인식하고 사고를 전환하는 능력'의 변화({diff['deltas']['MTI']:+.2f})가 "
-                                f"평균 변화({diff['avg_delta']:+.2f})보다 {'작습니다' if diff['mti_trait_stable'] else '큽니다'}.\n"
-                                f"다른 능력들이 변하는 동안 이 능력이 어떤 양상을 보였는지 1문장으로 서술하십시오.\n\n"
+                                f"STEP 2 — {step2_label}\n"
+                                f"  '스스로 틀렸음을 인식하고 사고를 전환하는 능력'({diff['deltas']['MTI']:+.2f})이 "
+                                f"{step2_mti_desc}\n"
+                                f"이 능력이 이번 변화에서 어떤 역할을 했는지 1문장으로 서술하십시오.\n\n"
 
                                 f"STEP 3 — 이 변화 패턴이 나타내는 인지 전환\n"
                                 f"  분류 힌트({diff['class_hint']})를 검토하고, "
