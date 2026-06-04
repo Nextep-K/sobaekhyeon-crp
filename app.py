@@ -1,22 +1,19 @@
 # =============================================================================
 # AIQ 파일럿 — Streamlit 앱
-# Version: v8.3  (2026.06)
+# Version: v8.5  (2026.06)
 #
 # 변경 이력:
-#   v8.3 — 응답자 식별 체계 전면 개편
-#          · 수동 user_id 입력 폐지 → 자동 채번 (#2026_000001 ~ #2026_999999)
-#          · 채번 시점: 진단 완료 시점 (중도 이탈자는 번호 미부여)
-#          · 동시성 안전: append_row 응답의 updatedRange에서 행 번호 추출
-#          · 응답자 정보: 이름 + 생년월일 8자리 + 동의 체크박스
-#          · Google Sheets 시트 분리: participants(식별) / responses(결과)
-#          · 진입 화면(stage_0) 재설계, 보고서 헤더 표시 변경
+#   v8.5 — 저장 채번 로직을 gspread 버전 독립적으로 수정
+#          · v8.3의 append_row 반환값 파싱 방식은 gspread 버전마다 다름
+#            (일부는 dict, 일부는 requests.Response 반환) → "저장 오류: <Response [200]>"
+#          · 수정: append_row 결과 무시, 직후 ws.col_values(1)로 행 수 조회 →
+#            마지막 행 번호로 serial 생성 → 첫 셀에 update_cell
+#          · 동시성 안전성 유지 (Google Sheets API의 append는 원자적)
 #
-#          [Sheets 마이그레이션 주의]
-#          기존 responses 시트가 v8.2 컬럼 구조라면 자동 호환되지 않음.
-#          새 시트로 시작하거나 기존 시트 백업 후 비울 것.
-#
-#   v8.2 — 9가지 정합성 이슈 수정 (20문항 None, 조건투입 1회 제한, stage 초기값 등)
-#   v8.1 — stage_4 결과 화면 개편 (보고서 헤더, AIQ hero, 서브 지표)
+#   v8.4 — 마지막 턴 LLM 응답 생략, 자동 다음 단계 이동
+#   v8.3 — 응답자 식별 체계 전면 개편 (자동 채번, 이름·생년월일, 동의)
+#   v8.2 — 9가지 정합성 이슈 수정
+#   v8.1 — stage_4 결과 화면 개편
 #   v8.0 — v7.4(탭 구조)에서 4단계 화면 전환 구조로 전면 개편
 # =============================================================================
 
@@ -184,14 +181,17 @@ def compute_aiq_index(qli: float, recon: float) -> int:
 # 15. log_topic1       — Topic 1 대화 로그 (role·content 리스트 문자열)
 # 16. log_topic2       — Topic 2 대화 로그 (role·content 리스트 문자열)
 #
-# ─── 자동 채번 메커니즘 ───
+# ─── 자동 채번 메커니즘 (v8.5) ───
 #
 # • 채번 시점: 진단 완료 시(save_result 호출 시점) — 중도 이탈자는 번호 미부여
-# • 채번 방식: participants 시트에 append_row 호출 후 응답의 updatedRange에서
-#   행 번호를 파싱 → serial 구성. Google Sheets API의 append가 원자적이므로
-#   동시 진입자가 있어도 시리얼 중복 없음.
+# • 채번 방식:
+#   1) participants 시트에 빈 serial로 행을 먼저 append
+#   2) 직후 ws.col_values(1)로 첫 컬럼의 전체 길이를 조회 → 마지막 행 번호 획득
+#   3) 헤더 행을 제외한 (행번호 - 1)을 6자리 시리얼로 변환
+#   4) 그 행의 첫 셀에 update_cell로 시리얼 값을 기록
+#   Google Sheets API의 append가 원자적이므로 동시 진입자가 있어도
+#   각 호출이 서로 다른 행을 차지한다.
 # • 형식: #2026_000001 ~ #2026_999999 (6자리 패딩)
-# • 헤더 행(1행)을 제외하므로 실제 데이터 행 번호 = 시리얼 번호 + 1
 #
 # ─── 마이그레이션 주의사항 ───
 #
@@ -230,10 +230,15 @@ def save_result(name: str, birth: str, type1: str, type2: str, type_scores: dict
     """
     진단 결과를 Google Sheets에 저장하고 자동 채번된 serial을 반환한다.
 
-    동시성 안전 채번:
-      participants 시트에 append_row 호출 → 응답의 updatedRange에서 행 번호 파싱
-      → "#2026_NNNNNN" 형식의 serial 생성. Google Sheets API의 append가 원자적이므로
-      동시 진입자가 있어도 같은 serial이 부여될 수 없음.
+    채번 방식 (v8.5):
+      1) participants 시트에 빈 serial로 행 append
+      2) ws.col_values(1)로 1번 컬럼 전체 길이 조회 → 마지막 행 번호 획득
+      3) (행번호 - 1)을 6자리 패딩한 "#2026_NNNNNN" 형식의 serial 생성
+      4) 첫 셀(serial 컬럼)에 update_cell로 값 기록
+
+      Google Sheets API의 append가 원자적이므로 동시 진입자가 있어도
+      각 호출이 서로 다른 행을 차지한다. col_values는 append 직후 실행되어
+      자신이 방금 추가한 행까지 포함한 정확한 행 수를 반환한다.
 
     반환값:
       성공: "#2026_000001" 같은 serial 문자열
@@ -251,21 +256,16 @@ def save_result(name: str, birth: str, type1: str, type2: str, type_scores: dict
             ws_p = ss.add_worksheet(title="participants", rows=5000, cols=10)
             ws_p.append_row(["serial", "timestamp", "name", "birth", "consent"])
 
-        # append_row 호출 — 응답에서 updatedRange를 받아 행 번호 추출
-        # placeholder로 빈 serial 자리를 두고 append → 그 행 번호로 serial 만든 뒤 update
-        result = ws_p.append_row(
+        # 빈 serial로 먼저 append (반환값에 의존하지 않음 — gspread 버전마다 다름)
+        ws_p.append_row(
             ["", ts, name, birth, "Y"],
-            value_input_option="RAW",
-            include_values_in_response=False
+            value_input_option="RAW"
         )
-        # result['updates']['updatedRange'] 예: "participants!A6:E6"
-        updated_range = result.get("updates", {}).get("updatedRange", "")
-        m = re.search(r"!\w+(\d+):", updated_range)
-        if not m:
-            # 파싱 실패 시 fallback — 전체 행 수 사용 (덜 안전하지만 동작은 함)
-            row_num = len(ws_p.get_all_values())
-        else:
-            row_num = int(m.group(1))
+
+        # append 직후 마지막 행 번호 조회
+        # col_values(1)은 1번 컬럼(serial 열)의 모든 값을 가져온다 (빈 값 포함, 마지막 비어있는 행까지)
+        col_a = ws_p.col_values(1)
+        row_num = len(col_a)  # 1-based: 헤더 포함 마지막 행 번호
 
         serial_num = row_num - 1  # 헤더 행(1행) 제외
         serial = f"#2026_{serial_num:06d}"
@@ -675,7 +675,8 @@ def stage_2():
             st.markdown(msg["content"])
 
     # 입력 (5턴 이하)
-    if st.session_state.t1_turns < 5:
+    MAX_TURNS_T1 = 5
+    if st.session_state.t1_turns < MAX_TURNS_T1:
         user_input = st.chat_input(
             placeholder="AI에게 질문하거나 생각을 입력하세요... (200자 이하)",
             max_chars=200,
@@ -684,18 +685,23 @@ def stage_2():
         if user_input:
             st.session_state.chat_t1.append({"role": "user", "content": user_input})
             st.session_state.t1_turns += 1
-            ai_resp = get_ai_response(st.session_state.chat_t1, topic=1)
-            st.session_state.chat_t1.append({"role": "assistant", "content": ai_resp})
-            st.rerun()
-    else:
-        st.info("최대 턴 수(5턴)에 도달했습니다.")
+            # 마지막 턴이면 LLM 응답 생략 + 자동 다음 단계 이동
+            if st.session_state.t1_turns >= MAX_TURNS_T1:
+                st.session_state.stage = 3
+                st.rerun()
+            else:
+                ai_resp = get_ai_response(st.session_state.chat_t1, topic=1)
+                st.session_state.chat_t1.append({"role": "assistant", "content": ai_resp})
+                st.rerun()
 
     st.divider()
-    st.caption(f"현재 {st.session_state.t1_turns} 턴 완료")
+    st.caption(f"현재 {st.session_state.t1_turns} / {MAX_TURNS_T1} 턴 완료")
 
-    if st.button("다음 시나리오로 →", use_container_width=True, type="primary"):
-        st.session_state.stage = 3
-        st.rerun()
+    # 조기 종료 옵션 — 5턴 미만에서도 다음 단계로 갈 수 있게
+    if 0 < st.session_state.t1_turns < MAX_TURNS_T1:
+        if st.button("다음 시나리오로 →", use_container_width=True, type="primary"):
+            st.session_state.stage = 3
+            st.rerun()
 
 
 # ─────────────────────────────────────────────
@@ -720,8 +726,18 @@ def stage_3():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+    def _run_scoring_and_advance():
+        """채점 실행 후 stage_4로 이동 — 마지막 턴 자동 / 조기 종료 버튼 공통 사용"""
+        with st.spinner("채점 중... (앙상블 3회, 약 20~30초 소요)"):
+            scores = run_scoring(st.session_state.chat_t1, st.session_state.chat_t2)
+            st.session_state.scores    = scores
+            st.session_state.aiq_index = compute_aiq_index(scores["QLI"], scores["Recon"])
+        st.session_state.stage = 4
+        st.rerun()
+
     # 입력 (7턴 이하)
-    if st.session_state.t2_turns < 7:
+    MAX_TURNS_T2 = 7
+    if st.session_state.t2_turns < MAX_TURNS_T2:
         user_input = st.chat_input(
             placeholder="AI에게 질문하거나 생각을 입력하세요... (200자 이하)",
             max_chars=200,
@@ -730,22 +746,21 @@ def stage_3():
         if user_input:
             st.session_state.chat_t2.append({"role": "user", "content": user_input})
             st.session_state.t2_turns += 1
-            ai_resp = get_ai_response(st.session_state.chat_t2, topic=2)
-            st.session_state.chat_t2.append({"role": "assistant", "content": ai_resp})
-            st.rerun()
-    else:
-        st.info("최대 턴 수(7턴)에 도달했습니다.")
+            # 마지막 턴이면 LLM 응답 생략 + 바로 채점·결과로 이동
+            if st.session_state.t2_turns >= MAX_TURNS_T2:
+                _run_scoring_and_advance()
+            else:
+                ai_resp = get_ai_response(st.session_state.chat_t2, topic=2)
+                st.session_state.chat_t2.append({"role": "assistant", "content": ai_resp})
+                st.rerun()
 
     st.divider()
-    st.caption(f"현재 {st.session_state.t2_turns} 턴 완료")
+    st.caption(f"현재 {st.session_state.t2_turns} / {MAX_TURNS_T2} 턴 완료")
 
-    if st.button("분석 요청 →", use_container_width=True, type="primary"):
-        with st.spinner("채점 중... (앙상블 3회, 약 20~30초 소요)"):
-            scores = run_scoring(st.session_state.chat_t1, st.session_state.chat_t2)
-            st.session_state.scores    = scores
-            st.session_state.aiq_index = compute_aiq_index(scores["QLI"], scores["Recon"])
-        st.session_state.stage = 4
-        st.rerun()
+    # 조기 종료 옵션 — 7턴 미만에서 분석 요청 가능
+    if 0 < st.session_state.t2_turns < MAX_TURNS_T2:
+        if st.button("분석 요청 →", use_container_width=True, type="primary"):
+            _run_scoring_and_advance()
 
 
 # ─────────────────────────────────────────────
