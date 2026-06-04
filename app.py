@@ -1,21 +1,21 @@
 # =============================================================================
 # AIQ 파일럿 — Streamlit 앱
-# Version: v8.6  (2026.06)
+# Version: v8.9  (2026.06)
 #
 # 변경 이력:
-#   v8.6 — 3가지 수정
-#          [버그] Topic 2 마지막 턴에서 채점 후 결과 화면으로 이동 실패
-#                 원인: st.spinner 컨텍스트 안에서 st.rerun() 호출 시 불안정.
-#                       또한 채점 진행 중 추가 입력이 들어오면 무한 반복 가능
-#                 수정: spinner 블록을 명확히 닫고, stage=4 변경과 rerun을 밖으로 분리.
-#                       채점 진행 플래그(scoring_in_progress)로 중복 호출 차단.
-#          [UX]  4점 척도 문구 변경
-#                "거의 안 한다 / 가끔 한다 / 자주 한다 / 항상 한다"
-#                → "거의 안 그렇다 / 가끔 그렇다 / 자주 그렇다 / 항상 그렇다"
-#          [UX]  "다음 시나리오로 / 분석 요청" 버튼 위치를 입력창 아래로 이동
-#                (자연스러운 시선 흐름: 대화 → 입력 → 종료 버튼)
+#   v8.9 — 최종 통독 검토 후 2건 수정
+#          [MEDIUM] stage_4 저장 중복 호출 가능성 차단
+#                   저장 실패 시 saved=False가 유지되어 매 렌더링마다 save_result
+#                   재호출 → 시트 중복 저장 가능
+#                   수정: 저장 성공·실패 무관하게 save_attempted=True 플래그로
+#                         1회만 호출 보장. 실패는 save_failed 플래그로 분리 표시
+#          [LOW]    stage_4의 ts 변수명이 save_result 내부의 ts(타임스탬프)와 동명
+#                   수정: stage_4의 type_scores 변수명을 type_sc로 변경
 #
-#   v8.5 — 저장 채번 로직을 gspread 버전 독립적으로 수정
+#   v8.8 — MAX_TURNS_T1 선언 순서 버그 수정 (NameError), docstring 갱신
+#   v8.7 — 저장오류·버튼위치·AIQ숫자·좌표점수 4가지 수정
+#   v8.6 — st.spinner + st.rerun() 충돌 해결
+#   v8.5 — 저장 채번 로직 gspread 버전 독립적으로 수정
 #   v8.4 — 마지막 턴 LLM 응답 생략, 자동 다음 단계 이동
 #   v8.3 — 응답자 식별 체계 전면 개편
 #   v8.2 — 9가지 정합성 이슈 수정
@@ -187,16 +187,15 @@ def compute_aiq_index(qli: float, recon: float) -> int:
 # 15. log_topic1       — Topic 1 대화 로그 (role·content 리스트 문자열)
 # 16. log_topic2       — Topic 2 대화 로그 (role·content 리스트 문자열)
 #
-# ─── 자동 채번 메커니즘 (v8.5) ───
+# ─── 자동 채번 메커니즘 (v8.7) ───
 #
 # • 채번 시점: 진단 완료 시(save_result 호출 시점) — 중도 이탈자는 번호 미부여
 # • 채번 방식:
-#   1) participants 시트에 빈 serial로 행을 먼저 append
-#   2) 직후 ws.col_values(1)로 첫 컬럼의 전체 길이를 조회 → 마지막 행 번호 획득
-#   3) 헤더 행을 제외한 (행번호 - 1)을 6자리 시리얼로 변환
-#   4) 그 행의 첫 셀에 update_cell로 시리얼 값을 기록
-#   Google Sheets API의 append가 원자적이므로 동시 진입자가 있어도
-#   각 호출이 서로 다른 행을 차지한다.
+#   1) append 전에 ws.get_all_values()로 현재 전체 행 수 조회
+#   2) 현재 행 수 = 다음에 추가될 데이터의 순번 (헤더 포함)
+#   3) serial 생성 후 데이터와 함께 한 번에 append
+#   get_all_values()는 gspread 모든 버전에서 list를 안정적으로 반환
+#   col_values(), update_cell() 사용 안 함 — 버전 의존성 완전 제거
 # • 형식: #2026_000001 ~ #2026_999999 (6자리 패딩)
 #
 # ─── 마이그레이션 주의사항 ───
@@ -236,15 +235,12 @@ def save_result(name: str, birth: str, type1: str, type2: str, type_scores: dict
     """
     진단 결과를 Google Sheets에 저장하고 자동 채번된 serial을 반환한다.
 
-    채번 방식 (v8.5):
-      1) participants 시트에 빈 serial로 행 append
-      2) ws.col_values(1)로 1번 컬럼 전체 길이 조회 → 마지막 행 번호 획득
-      3) (행번호 - 1)을 6자리 패딩한 "#2026_NNNNNN" 형식의 serial 생성
-      4) 첫 셀(serial 컬럼)에 update_cell로 값 기록
-
-      Google Sheets API의 append가 원자적이므로 동시 진입자가 있어도
-      각 호출이 서로 다른 행을 차지한다. col_values는 append 직후 실행되어
-      자신이 방금 추가한 행까지 포함한 정확한 행 수를 반환한다.
+    채번 방식 (v8.7):
+      1) append 전에 ws.get_all_values()로 현재 전체 행 수 조회
+      2) 현재 행 수(헤더 포함) = 다음 데이터의 순번
+      3) serial을 생성하여 데이터와 함께 한 번에 append
+      get_all_values()는 gspread 모든 버전에서 list를 안정적으로 반환.
+      col_values(), update_cell() 사용 안 함 — 버전 의존성 완전 제거.
 
     반환값:
       성공: "#2026_000001" 같은 serial 문자열
@@ -262,22 +258,17 @@ def save_result(name: str, birth: str, type1: str, type2: str, type_scores: dict
             ws_p = ss.add_worksheet(title="participants", rows=5000, cols=10)
             ws_p.append_row(["serial", "timestamp", "name", "birth", "consent"])
 
-        # 빈 serial로 먼저 append (반환값에 의존하지 않음 — gspread 버전마다 다름)
+        # 채번: append 전에 현재 행 수를 먼저 확인
+        # get_all_values()는 gspread 모든 버전에서 안정적으로 list를 반환
+        all_rows = ws_p.get_all_values()
+        next_num = len(all_rows)  # 헤더 포함 현재 행 수 = 다음 데이터의 번호
+        serial   = f"#2026_{next_num:06d}"
+
+        # serial을 포함해서 한 번에 append
         ws_p.append_row(
-            ["", ts, name, birth, "Y"],
+            [serial, ts, name, birth, "Y"],
             value_input_option="RAW"
         )
-
-        # append 직후 마지막 행 번호 조회
-        # col_values(1)은 1번 컬럼(serial 열)의 모든 값을 가져온다 (빈 값 포함, 마지막 비어있는 행까지)
-        col_a = ws_p.col_values(1)
-        row_num = len(col_a)  # 1-based: 헤더 포함 마지막 행 번호
-
-        serial_num = row_num - 1  # 헤더 행(1행) 제외
-        serial = f"#2026_{serial_num:06d}"
-
-        # 빈 serial 셀에 실제 값 기록
-        ws_p.update_cell(row_num, 1, serial)
 
         # ─── 2) responses 시트에 append ───
         try:
@@ -522,7 +513,7 @@ st.markdown("""
                      border-radius: 12px; margin: 0 0 1.5rem; border: 1px solid #DBEAFE; }
     .aiq-label     { font-size: 13px; font-weight: 500; color: #6B7280;
                      letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 0.5rem; }
-    .aiq-value     { font-size: 96px; font-weight: 300; color: #1D6FA8;
+    .aiq-value     { font-size: 96px; font-weight: 700; color: #1D6FA8;
                      line-height: 1; margin: 0; letter-spacing: -2px; }
     .aiq-badge-row { margin-top: 0.75rem; display: flex; justify-content: center;
                      gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -572,7 +563,8 @@ def init_state():
         "user_birth":     "",      # 생년월일 YYYYMMDD 8자리
         "consent_given":  False,   # 개인정보 수집 동의
         "user_serial":    "",      # 자동 채번된 #2026_NNNNNN (진단 완료 후 부여)
-        "saved":          False,
+        "saved":          False,   # 저장 성공 여부
+        "save_attempted": False,   # 저장 시도 여부 (1회 제한 — 성공·실패 무관)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -664,6 +656,7 @@ def stage_1():
 # ─────────────────────────────────────────────
 def stage_2():
     step_bar(2)
+    MAX_TURNS_T1 = 5  # 함수 첫 부분에 선언 — 이후 모든 참조보다 앞서야 함
     st.markdown('<span class="topic-tag t1-tag">Topic 1 — 질문 수준 측정 · 최대 5턴</span>', unsafe_allow_html=True)
     scn_html = TOPIC1_SCENARIO.replace("\n\n", "<br><br>").replace("\n", "<br>")
     st.markdown(f'<div class="scn-box"><p class="scn-title">두 사람의 조언</p><p class="scn-text">{scn_html}</p></div>', unsafe_allow_html=True)
@@ -681,33 +674,35 @@ def stage_2():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # 입력 (5턴 이하)
-    MAX_TURNS_T1 = 5
-    if st.session_state.t1_turns < MAX_TURNS_T1:
-        user_input = st.chat_input(
-            placeholder="AI에게 질문하거나 생각을 입력하세요... (200자 이하)",
-            max_chars=200,
-            key="t1_input"
-        )
-        if user_input:
-            st.session_state.chat_t1.append({"role": "user", "content": user_input})
-            st.session_state.t1_turns += 1
-            # 마지막 턴이면 LLM 응답 생략 + 자동 다음 단계 이동
-            if st.session_state.t1_turns >= MAX_TURNS_T1:
-                st.session_state.stage = 3
-                st.rerun()
-            else:
-                ai_resp = get_ai_response(st.session_state.chat_t1, topic=1)
-                st.session_state.chat_t1.append({"role": "assistant", "content": ai_resp})
-                st.rerun()
-
     st.caption(f"현재 {st.session_state.t1_turns} / {MAX_TURNS_T1} 턴 완료")
 
-    # 조기 종료 옵션 — 입력창 아래, 1~4턴에서 노출
+    # 조기 종료 옵션 — 1~4턴에서 노출 (대화 바로 아래)
     if 0 < st.session_state.t1_turns < MAX_TURNS_T1:
         if st.button("다음 시나리오로 →", use_container_width=True, type="primary", key="t1_finish"):
             st.session_state.stage = 3
             st.rerun()
+
+    # 입력창 (종료 버튼 아래)
+    if st.session_state.t1_turns < MAX_TURNS_T1:
+        user_input = st.text_area(
+            label="입력",
+            placeholder="AI에게 질문하거나 생각을 입력하세요... (200자 이하)",
+            max_chars=200,
+            key="t1_textarea",
+            label_visibility="collapsed",
+            height=80
+        )
+        if st.button("전송 ↑", key="t1_send", use_container_width=False):
+            if user_input and user_input.strip():
+                st.session_state.chat_t1.append({"role": "user", "content": user_input.strip()})
+                st.session_state.t1_turns += 1
+                if st.session_state.t1_turns >= MAX_TURNS_T1:
+                    st.session_state.stage = 3
+                    st.rerun()
+                else:
+                    ai_resp = get_ai_response(st.session_state.chat_t1, topic=1)
+                    st.session_state.chat_t1.append({"role": "assistant", "content": ai_resp})
+                    st.rerun()
 
 
 # ─────────────────────────────────────────────
@@ -734,55 +729,56 @@ def stage_3():
 
     MAX_TURNS_T2 = 7
 
-    # ─── 채점 진행 중이면 즉시 처리 (spinner는 컨텍스트 매니저 자연 종료 후 rerun) ───
+    # ─── 채점 진행 중이면 즉시 처리 ───
     if st.session_state.get("scoring_in_progress", False):
         with st.spinner("채점 중... (앙상블 3회, 약 20~30초 소요)"):
             scores = run_scoring(st.session_state.chat_t1, st.session_state.chat_t2)
             st.session_state.scores    = scores
             st.session_state.aiq_index = compute_aiq_index(scores["QLI"], scores["Recon"])
-        # spinner 블록 종료 후 stage 변경 + rerun
         st.session_state.scoring_in_progress = False
         st.session_state.stage = 4
         st.rerun()
-        return  # 안전장치 — 도달하지 않지만 명시
-
-    # ─── 입력 처리 (7턴 미만일 때만 입력창 노출) ───
-    if st.session_state.t2_turns < MAX_TURNS_T2:
-        user_input = st.chat_input(
-            placeholder="AI에게 질문하거나 생각을 입력하세요... (200자 이하)",
-            max_chars=200,
-            key="t2_input"
-        )
-        if user_input:
-            st.session_state.chat_t2.append({"role": "user", "content": user_input})
-            st.session_state.t2_turns += 1
-            # 마지막 턴이면 LLM 응답 생략 + 채점 모드 진입
-            if st.session_state.t2_turns >= MAX_TURNS_T2:
-                st.session_state.scoring_in_progress = True
-                st.rerun()
-            else:
-                ai_resp = get_ai_response(st.session_state.chat_t2, topic=2)
-                st.session_state.chat_t2.append({"role": "assistant", "content": ai_resp})
-                st.rerun()
+        return
 
     st.caption(f"현재 {st.session_state.t2_turns} / {MAX_TURNS_T2} 턴 완료")
 
-    # 조기 종료 옵션 — 입력창 아래, 1~6턴에서만 노출
+    # 조기 종료 옵션 — 1~6턴에서 노출 (대화 바로 아래)
     if 0 < st.session_state.t2_turns < MAX_TURNS_T2:
         if st.button("분석 요청 →", use_container_width=True, type="primary", key="t2_finish"):
             st.session_state.scoring_in_progress = True
             st.rerun()
+
+    # 입력창 (7턴 이하, 종료 버튼 아래)
+    if st.session_state.t2_turns < MAX_TURNS_T2:
+        user_input = st.text_area(
+            label="입력",
+            placeholder="AI에게 질문하거나 생각을 입력하세요... (200자 이하)",
+            max_chars=200,
+            key="t2_textarea",
+            label_visibility="collapsed",
+            height=80
+        )
+        if st.button("전송 ↑", key="t2_send", use_container_width=False):
+            if user_input and user_input.strip():
+                st.session_state.chat_t2.append({"role": "user", "content": user_input.strip()})
+                st.session_state.t2_turns += 1
+                if st.session_state.t2_turns >= MAX_TURNS_T2:
+                    st.session_state.scoring_in_progress = True
+                    st.rerun()
+                else:
+                    ai_resp = get_ai_response(st.session_state.chat_t2, topic=2)
+                    st.session_state.chat_t2.append({"role": "assistant", "content": ai_resp})
+                    st.rerun()
 
 
 # ─────────────────────────────────────────────
 # 3단계: 결과 리포트
 # ─────────────────────────────────────────────
 def stage_4():
-    # v8.1 — 스텝바 제거, 보고서 헤더로 대체
     scores    = st.session_state.scores
     type1     = st.session_state.type1
     type2     = st.session_state.type2
-    ts        = st.session_state.type_scores
+    type_sc   = st.session_state.type_scores   # ts → type_sc (save_result 내부 ts와 구분)
     aiq       = st.session_state.aiq_index
     qli       = scores.get("QLI",   5.0)
     mti       = scores.get("MTI",   5.0)
@@ -792,13 +788,15 @@ def stage_4():
     low_rel        = scores.get("low_reliability", False)
     scoring_failed = scores.get("scoring_failed", False)
 
-    # ─── 저장 (시리얼 채번) — 헤더 표시보다 먼저 실행 ───
-    if not st.session_state.saved:
+    # ─── 저장 (시리얼 채번) — 1회만 시도 ───
+    # save_attempted: 성공·실패 무관하게 True로 세팅 → 중복 저장 차단
+    if not st.session_state.save_attempted:
+        st.session_state.save_attempted = True
         serial = save_result(
             name=st.session_state.user_name,
             birth=st.session_state.user_birth,
             type1=type1, type2=type2,
-            type_scores=ts, qli=qli, recon=recon,
+            type_scores=type_sc, qli=qli, recon=recon,
             mti=mti, aiq=aiq, has_class_s=has_cs,
             answers=st.session_state.answers,
             log_t1=st.session_state.chat_t1,
@@ -853,21 +851,18 @@ def stage_4():
     # ─── 4유형 좌표 ───
     st.markdown('<p class="sub-section-title">유형 좌표</p>', unsafe_allow_html=True)
     type_order = ["상상가형", "설계자형", "의존형", "실행형"]
-    labels_map = {"설계자": "설계자형", "상상가": "상상가형", "실행": "실행형", "의존": "의존형"}
 
     html_coord = '<div class="coord-grid">'
     for t in type_order:
-        raw_key = next((k for k, v in labels_map.items() if v == t), "")
-        score_val = ts.get(raw_key, 0)
         is_first  = (t == type1)
         is_second = (t == type2)
         suffix    = " ✦" if is_first else ""
-        rank_note = " — 1순위" if is_first else (" — 2순위" if is_second else "")
+        rank_note = "1순위" if is_first else ("2순위" if is_second else "")
         cls       = "cc cc-hl" if is_first else "cc"
         html_coord += (
             f'<div class="{cls}">'
             f'<span class="cc-name">{t}{suffix}</span>'
-            f'<span class="cc-tag">{score_val}점{rank_note}</span>'
+            f'<span class="cc-tag">{rank_note}</span>'
             f'</div>'
         )
     html_coord += '</div>'
