@@ -4,12 +4,13 @@
 #
 # 변경 이력:
 #   v8.9 FINAL — gspread 연결 방식 + 저장 알고리듬 최종 수정
-#          [CRITICAL] gspread.authorize(creds) → gspread.Client(auth=creds)
-#                     gspread 6.x에서 authorize()가 deprecated → gc.open() 단계에서
-#                     <Response [200]> 예외 발생 → 저장 로직 도달 불가
+#          [CRITICAL] gspread.service_account_from_dict() 적용
+#                     gspread.authorize() → Client(auth=creds) 거쳐 최종 확정
+#                     Client(auth=creds)는 HTTP 세션 누락 → gc.open() 시
+#                     구글 로그인 페이지(HTML)가 반환되어 <Response [200]> 발생
+#                     service_account_from_dict()는 인증 + HTTP 세션을 완전히 구성
 #          [CRITICAL] append_row → safe_append (worksheet.update 기반)
-#                     append_row 내부의 테이블 범위 유추 파싱 충돌 원천 차단
-#                     명시적 셀 위치(A{next_row}) 지정으로 덮어쓰기
+#                     테이블 범위 유추 파싱 충돌 원천 차단
 #
 #   v8.9 — participants/responses 독립 try-except, ValueInputOption.raw, rows=1
 #   v8.8 — MAX_TURNS_T1 선언 순서 버그(NameError) 수정
@@ -30,7 +31,6 @@ from datetime import datetime
 import pytz
 import gspread
 from gspread.utils import ValueInputOption   # append_row 옵션 — 문자열 대신 객체 전달
-from google.oauth2.service_account import Credentials
 
 # ─────────────────────────────────────────────
 # 설정
@@ -220,15 +220,11 @@ def compute_aiq_index(qli: float, recon: float) -> int:
 
 @st.cache_resource
 def get_gsheet_client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=scopes
-    )
-    # gspread 6.x: authorize()는 deprecated → Client(auth=creds) 사용
-    return gspread.Client(auth=creds)
+    # gspread 6.x 공식 권장 인증 방식
+    # service_account_from_dict()는 인증 + HTTP 세션을 완전히 구성한다
+    # Client(auth=creds)는 세션 누락으로 200 OK 로그인 페이지 반환 → 파싱 충돌 유발
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    return gspread.service_account_from_dict(creds_dict)
 
 
 def safe_append(ws, data_list: list) -> None:
@@ -278,7 +274,7 @@ def save_result(name: str, birth: str, type1: str, type2: str, type_scores: dict
     진단 결과를 Google Sheets에 저장하고 자동 채번된 serial을 반환한다.
 
     저장 구조 (v8.9 FINAL):
-      gspread.Client(auth=creds) — gspread 6.x 호환 연결 방식
+      gspread.service_account_from_dict() — 인증 + HTTP 세션 완전 구성
       safe_append() — append_row 대신 worksheet.update 기반 명시적 기록
       participants / responses 독립 try-except — 어느 쪽 오류도 전체를 차단하지 않음
 
