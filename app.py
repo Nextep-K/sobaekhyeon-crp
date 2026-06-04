@@ -3,19 +3,22 @@
 # Version: v8.9  (2026.06)
 #
 # 변경 이력:
-#   v8.9 — 최종 통독 검토 후 2건 수정
-#          [MEDIUM] stage_4 저장 중복 호출 가능성 차단
-#                   저장 실패 시 saved=False가 유지되어 매 렌더링마다 save_result
-#                   재호출 → 시트 중복 저장 가능
-#                   수정: 저장 성공·실패 무관하게 save_attempted=True 플래그로
-#                         1회만 호출 보장. 실패는 save_failed 플래그로 분리 표시
-#          [LOW]    stage_4의 ts 변수명이 save_result 내부의 ts(타임스탬프)와 동명
-#                   수정: stage_4의 type_scores 변수명을 type_sc로 변경
+#   v8.9 — 저장 로직 전면 수정 (크로스 체크 후 최종 적용)
+#          [HIGH] participants / responses 저장을 독립 try-except로 분리
+#                 기존: 단일 try-except → participants에서 예외 발생 시 responses 저장 차단
+#                 수정: 각 시트 저장을 독립 블록으로 — 앞 단계 예외와 무관하게 강행
+#          [HIGH] value_input_option="RAW" → ValueInputOption.raw
+#                 gspread 6.x에서 문자열 전달이 내부 파싱 충돌 유발
+#          [HIGH] rows=5000 → rows=1
+#                 5000행 빈 시트 생성 시 append_row가 5001행에 저장
+#          [MEDIUM] get_all_values() 별도 예외 처리 추가
+#                   파싱 오류 시 빈 리스트로 초기화하여 다음 로직 보호
+#          [MEDIUM] 저장 1회 보장 (save_attempted 플래그, v8.8에서 이어짐)
 #
-#   v8.8 — MAX_TURNS_T1 선언 순서 버그 수정 (NameError), docstring 갱신
+#   v8.8 — MAX_TURNS_T1 선언 순서 버그(NameError) 수정, docstring 갱신
 #   v8.7 — 저장오류·버튼위치·AIQ숫자·좌표점수 4가지 수정
 #   v8.6 — st.spinner + st.rerun() 충돌 해결
-#   v8.5 — 저장 채번 로직 gspread 버전 독립적으로 수정
+#   v8.5 — 저장 채번 로직 gspread 버전 독립 1차 수정
 #   v8.4 — 마지막 턴 LLM 응답 생략, 자동 다음 단계 이동
 #   v8.3 — 응답자 식별 체계 전면 개편
 #   v8.2 — 9가지 정합성 이슈 수정
@@ -29,6 +32,7 @@ import re
 from datetime import datetime
 import pytz
 import gspread
+from gspread.utils import ValueInputOption   # append_row 옵션 — 문자열 대신 객체 전달
 from google.oauth2.service_account import Credentials
 
 # ─────────────────────────────────────────────
@@ -187,16 +191,18 @@ def compute_aiq_index(qli: float, recon: float) -> int:
 # 15. log_topic1       — Topic 1 대화 로그 (role·content 리스트 문자열)
 # 16. log_topic2       — Topic 2 대화 로그 (role·content 리스트 문자열)
 #
-# ─── 자동 채번 메커니즘 (v8.7) ───
+# ─── 자동 채번 메커니즘 (v8.9) ───
 #
 # • 채번 시점: 진단 완료 시(save_result 호출 시점) — 중도 이탈자는 번호 미부여
 # • 채번 방식:
-#   1) append 전에 ws.get_all_values()로 현재 전체 행 수 조회
-#   2) 현재 행 수 = 다음에 추가될 데이터의 순번 (헤더 포함)
-#   3) serial 생성 후 데이터와 함께 한 번에 append
-#   get_all_values()는 gspread 모든 버전에서 list를 안정적으로 반환
-#   col_values(), update_cell() 사용 안 함 — 버전 의존성 완전 제거
+#   1) append 전 get_all_values()로 현재 행 수 조회 (예외 시 빈 리스트 fallback)
+#   2) 현재 행 수(헤더 포함) = 다음 데이터 순번 → serial 생성
+#   3) serial 포함 데이터를 한 번에 append (ValueInputOption.raw 객체 전달)
+# • 시트 생성: rows=1 (append_row가 자동으로 행 증가 — 5000행 불필요)
+# • 오류 방어: participants / responses 독립 try-except
+#   participants에서 <Response [200]> 예외가 나도 responses 저장은 강행
 # • 형식: #2026_000001 ~ #2026_999999 (6자리 패딩)
+#         임시 ID: participants 오류 시 #2026_tmp_타임스탬프로 fallback
 #
 # ─── 마이그레이션 주의사항 ───
 #
@@ -235,67 +241,93 @@ def save_result(name: str, birth: str, type1: str, type2: str, type_scores: dict
     """
     진단 결과를 Google Sheets에 저장하고 자동 채번된 serial을 반환한다.
 
-    채번 방식 (v8.7):
-      1) append 전에 ws.get_all_values()로 현재 전체 행 수 조회
-      2) 현재 행 수(헤더 포함) = 다음 데이터의 순번
-      3) serial을 생성하여 데이터와 함께 한 번에 append
-      get_all_values()는 gspread 모든 버전에서 list를 안정적으로 반환.
-      col_values(), update_cell() 사용 안 함 — 버전 의존성 완전 제거.
+    저장 구조 (v8.9):
+      participants 시트와 responses 시트를 독립 try-except로 분리.
+      participants에서 gspread 파싱 예외(<Response [200]>)가 발생해도
+      responses 저장은 반드시 실행된다.
+
+    채번 방식:
+      append 전에 get_all_values()로 현재 행 수 조회 → serial 생성 → 한 번에 append.
+      rows=1로 시트 생성 — append_row가 행을 자동 증가시키므로 5000행 불필요.
+      value_input_option=ValueInputOption.raw — 문자열 "RAW" 대신 객체 전달
+      (gspread 6.x에서 문자열이 내부 파싱 충돌 유발).
 
     반환값:
       성공: "#2026_000001" 같은 serial 문자열
-      실패: None (저장 오류 시)
+      실패: None
     """
+    serial = None
+
     try:
         gc = get_gsheet_client()
         ss = gc.open(SHEET_NAME)
         ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    except Exception as e:
+        st.warning(f"저장 오류 — Sheets 연결 실패: {e}")
+        return None
 
-        # ─── 1) participants 시트에 append (채번) ───
+    # ─── 1) participants 시트 저장 (채번 포함) ───
+    # 예외가 발생해도 responses 저장을 차단하지 않는다
+    try:
         try:
             ws_p = ss.worksheet("participants")
         except gspread.WorksheetNotFound:
-            ws_p = ss.add_worksheet(title="participants", rows=5000, cols=10)
-            ws_p.append_row(["serial", "timestamp", "name", "birth", "consent"])
+            ws_p = ss.add_worksheet(title="participants", rows=1, cols=10)
+            ws_p.append_row(
+                ["serial", "timestamp", "name", "birth", "consent"],
+                value_input_option=ValueInputOption.raw
+            )
 
-        # 채번: append 전에 현재 행 수를 먼저 확인
-        # get_all_values()는 gspread 모든 버전에서 안정적으로 list를 반환
-        all_rows = ws_p.get_all_values()
-        next_num = len(all_rows)  # 헤더 포함 현재 행 수 = 다음 데이터의 번호
+        # get_all_values() 예외 처리 — 파싱 오류 시 빈 리스트로 fallback
+        try:
+            all_rows = ws_p.get_all_values()
+        except Exception:
+            all_rows = []
+
+        next_num = len(all_rows)          # 헤더 포함 현재 행 수 = 다음 데이터 순번
         serial   = f"#2026_{next_num:06d}"
 
-        # serial을 포함해서 한 번에 append
         ws_p.append_row(
             [serial, ts, name, birth, "Y"],
-            value_input_option="RAW"
+            value_input_option=ValueInputOption.raw
         )
+    except Exception as e:
+        # <Response [200]> 포함 모든 예외 — 데이터는 서버에 저장됐을 수 있음
+        # serial이 None이면 임시 ID 부여하여 responses 저장은 계속 진행
+        st.warning(f"participants 저장 중 파싱 오류 (데이터는 저장됐을 수 있음): {e}")
+        if serial is None:
+            serial = f"#2026_tmp_{ts.replace(' ', '_').replace(':', '')}"
 
-        # ─── 2) responses 시트에 append ───
+    # ─── 2) responses 시트 저장 (participants 예외와 무관하게 강행) ───
+    try:
         try:
             ws_r = ss.worksheet("responses")
         except gspread.WorksheetNotFound:
-            ws_r = ss.add_worksheet(title="responses", rows=5000, cols=20)
-            ws_r.append_row([
-                "serial", "timestamp",
-                "type1", "type2",
-                "score_designer", "score_imaginer", "score_executor", "score_follower",
-                "QLI", "Recon", "MTI", "AIQ_index", "class_s",
-                "q_answers", "log_topic1", "log_topic2"
-            ])
-        ws_r.append_row([
-            serial, ts,
-            type1, type2,
-            type_scores.get("설계자", 0), type_scores.get("상상가", 0),
-            type_scores.get("실행", 0), type_scores.get("의존", 0),
-            round(qli, 2), round(recon, 2), round(mti, 2), aiq,
-            "Y" if has_class_s else "N",
-            str(answers),
-            str(log_t1),
-            str(log_t2)
-        ])
+            ws_r = ss.add_worksheet(title="responses", rows=1, cols=20)
+            ws_r.append_row(
+                ["serial", "timestamp",
+                 "type1", "type2",
+                 "score_designer", "score_imaginer", "score_executor", "score_follower",
+                 "QLI", "Recon", "MTI", "AIQ_index", "class_s",
+                 "q_answers", "log_topic1", "log_topic2"],
+                value_input_option=ValueInputOption.raw
+            )
+
+        ws_r.append_row(
+            [serial, ts,
+             type1, type2,
+             type_scores.get("설계자", 0), type_scores.get("상상가", 0),
+             type_scores.get("실행", 0),   type_scores.get("의존", 0),
+             round(qli, 2), round(recon, 2), round(mti, 2), aiq,
+             "Y" if has_class_s else "N",
+             str(answers),
+             str(log_t1),
+             str(log_t2)],
+            value_input_option=ValueInputOption.raw
+        )
         return serial
     except Exception as e:
-        st.warning(f"저장 오류: {e}")
+        st.warning(f"responses 저장 오류: {e}")
         return None
 
 
