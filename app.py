@@ -1,17 +1,23 @@
 # =============================================================================
 # AIQ 파일럿 — Streamlit 앱
-# Version: v8.5  (2026.06)
+# Version: v8.6  (2026.06)
 #
 # 변경 이력:
-#   v8.5 — 저장 채번 로직을 gspread 버전 독립적으로 수정
-#          · v8.3의 append_row 반환값 파싱 방식은 gspread 버전마다 다름
-#            (일부는 dict, 일부는 requests.Response 반환) → "저장 오류: <Response [200]>"
-#          · 수정: append_row 결과 무시, 직후 ws.col_values(1)로 행 수 조회 →
-#            마지막 행 번호로 serial 생성 → 첫 셀에 update_cell
-#          · 동시성 안전성 유지 (Google Sheets API의 append는 원자적)
+#   v8.6 — 3가지 수정
+#          [버그] Topic 2 마지막 턴에서 채점 후 결과 화면으로 이동 실패
+#                 원인: st.spinner 컨텍스트 안에서 st.rerun() 호출 시 불안정.
+#                       또한 채점 진행 중 추가 입력이 들어오면 무한 반복 가능
+#                 수정: spinner 블록을 명확히 닫고, stage=4 변경과 rerun을 밖으로 분리.
+#                       채점 진행 플래그(scoring_in_progress)로 중복 호출 차단.
+#          [UX]  4점 척도 문구 변경
+#                "거의 안 한다 / 가끔 한다 / 자주 한다 / 항상 한다"
+#                → "거의 안 그렇다 / 가끔 그렇다 / 자주 그렇다 / 항상 그렇다"
+#          [UX]  "다음 시나리오로 / 분석 요청" 버튼 위치를 입력창 아래로 이동
+#                (자연스러운 시선 흐름: 대화 → 입력 → 종료 버튼)
 #
+#   v8.5 — 저장 채번 로직을 gspread 버전 독립적으로 수정
 #   v8.4 — 마지막 턴 LLM 응답 생략, 자동 다음 단계 이동
-#   v8.3 — 응답자 식별 체계 전면 개편 (자동 채번, 이름·생년월일, 동의)
+#   v8.3 — 응답자 식별 체계 전면 개편
 #   v8.2 — 9가지 정합성 이슈 수정
 #   v8.1 — stage_4 결과 화면 개편
 #   v8.0 — v7.4(탭 구조)에서 4단계 화면 전환 구조로 전면 개편
@@ -558,6 +564,7 @@ def init_state():
         "t1_turns":       0,
         "t2_turns":       0,
         "t2_injected":    False,   # Topic 2 조건 투입 여부 (1회 제한)
+        "scoring_in_progress": False,  # 채점 진행 중 플래그 (중복 호출 차단)
         "scores":         {},      # 채점 결과
         "aiq_index":      0,
         # ─── v8.3 — 응답자 식별 ───
@@ -611,7 +618,7 @@ def stage_1():
     st.caption("20개 행동 문항에 응답해주세요. 정답이 없으며 평소 습관을 기준으로 선택하세요.")
     st.divider()
 
-    SCALE_LABELS = ["① 거의 안 한다", "② 가끔 한다", "③ 자주 한다", "④ 항상 한다"]
+    SCALE_LABELS = ["① 거의 안 그렇다", "② 가끔 그렇다", "③ 자주 그렇다", "④ 항상 그렇다"]
 
     with st.form("q_form"):
         answers = {}
@@ -694,12 +701,11 @@ def stage_2():
                 st.session_state.chat_t1.append({"role": "assistant", "content": ai_resp})
                 st.rerun()
 
-    st.divider()
     st.caption(f"현재 {st.session_state.t1_turns} / {MAX_TURNS_T1} 턴 완료")
 
-    # 조기 종료 옵션 — 5턴 미만에서도 다음 단계로 갈 수 있게
+    # 조기 종료 옵션 — 입력창 아래, 1~4턴에서 노출
     if 0 < st.session_state.t1_turns < MAX_TURNS_T1:
-        if st.button("다음 시나리오로 →", use_container_width=True, type="primary"):
+        if st.button("다음 시나리오로 →", use_container_width=True, type="primary", key="t1_finish"):
             st.session_state.stage = 3
             st.rerun()
 
@@ -726,17 +732,21 @@ def stage_3():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    def _run_scoring_and_advance():
-        """채점 실행 후 stage_4로 이동 — 마지막 턴 자동 / 조기 종료 버튼 공통 사용"""
+    MAX_TURNS_T2 = 7
+
+    # ─── 채점 진행 중이면 즉시 처리 (spinner는 컨텍스트 매니저 자연 종료 후 rerun) ───
+    if st.session_state.get("scoring_in_progress", False):
         with st.spinner("채점 중... (앙상블 3회, 약 20~30초 소요)"):
             scores = run_scoring(st.session_state.chat_t1, st.session_state.chat_t2)
             st.session_state.scores    = scores
             st.session_state.aiq_index = compute_aiq_index(scores["QLI"], scores["Recon"])
+        # spinner 블록 종료 후 stage 변경 + rerun
+        st.session_state.scoring_in_progress = False
         st.session_state.stage = 4
         st.rerun()
+        return  # 안전장치 — 도달하지 않지만 명시
 
-    # 입력 (7턴 이하)
-    MAX_TURNS_T2 = 7
+    # ─── 입력 처리 (7턴 미만일 때만 입력창 노출) ───
     if st.session_state.t2_turns < MAX_TURNS_T2:
         user_input = st.chat_input(
             placeholder="AI에게 질문하거나 생각을 입력하세요... (200자 이하)",
@@ -746,21 +756,22 @@ def stage_3():
         if user_input:
             st.session_state.chat_t2.append({"role": "user", "content": user_input})
             st.session_state.t2_turns += 1
-            # 마지막 턴이면 LLM 응답 생략 + 바로 채점·결과로 이동
+            # 마지막 턴이면 LLM 응답 생략 + 채점 모드 진입
             if st.session_state.t2_turns >= MAX_TURNS_T2:
-                _run_scoring_and_advance()
+                st.session_state.scoring_in_progress = True
+                st.rerun()
             else:
                 ai_resp = get_ai_response(st.session_state.chat_t2, topic=2)
                 st.session_state.chat_t2.append({"role": "assistant", "content": ai_resp})
                 st.rerun()
 
-    st.divider()
     st.caption(f"현재 {st.session_state.t2_turns} / {MAX_TURNS_T2} 턴 완료")
 
-    # 조기 종료 옵션 — 7턴 미만에서 분석 요청 가능
+    # 조기 종료 옵션 — 입력창 아래, 1~6턴에서만 노출
     if 0 < st.session_state.t2_turns < MAX_TURNS_T2:
-        if st.button("분석 요청 →", use_container_width=True, type="primary"):
-            _run_scoring_and_advance()
+        if st.button("분석 요청 →", use_container_width=True, type="primary", key="t2_finish"):
+            st.session_state.scoring_in_progress = True
+            st.rerun()
 
 
 # ─────────────────────────────────────────────
