@@ -1,13 +1,30 @@
+# =============================================================================
+# AIQ 파일럿 — Streamlit 앱
+# Version: v8.3  (2026.06)
+#
+# 변경 이력:
+#   v8.3 — 응답자 식별 체계 전면 개편
+#          · 수동 user_id 입력 폐지 → 자동 채번 (#2026_000001 ~ #2026_999999)
+#          · 채번 시점: 진단 완료 시점 (중도 이탈자는 번호 미부여)
+#          · 동시성 안전: append_row 응답의 updatedRange에서 행 번호 추출
+#          · 응답자 정보: 이름 + 생년월일 8자리 + 동의 체크박스
+#          · Google Sheets 시트 분리: participants(식별) / responses(결과)
+#          · 진입 화면(stage_0) 재설계, 보고서 헤더 표시 변경
+#
+#          [Sheets 마이그레이션 주의]
+#          기존 responses 시트가 v8.2 컬럼 구조라면 자동 호환되지 않음.
+#          새 시트로 시작하거나 기존 시트 백업 후 비울 것.
+#
+#   v8.2 — 9가지 정합성 이슈 수정 (20문항 None, 조건투입 1회 제한, stage 초기값 등)
+#   v8.1 — stage_4 결과 화면 개편 (보고서 헤더, AIQ hero, 서브 지표)
+#   v8.0 — v7.4(탭 구조)에서 4단계 화면 전환 구조로 전면 개편
+# =============================================================================
+
 import streamlit as st
-import streamlit.components.v1 as components
 from openai import OpenAI
-import pandas as pd
 import re
 from datetime import datetime
 import pytz
-from fpdf import FPDF
-import matplotlib.pyplot as plt
-import io
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -15,147 +32,183 @@ from google.oauth2.service_account import Credentials
 # 설정
 # ─────────────────────────────────────────────
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-st.set_page_config(page_title="소백현 CRP", layout="wide")
-st.title("🧠 소백현: CRP 분석 엔진")
-st.markdown("3회 교차 검증을 통해 신뢰도를 높이고 인지 분석 리포트를 생성합니다.")
-st.divider()
+st.set_page_config(page_title="AIQ 진단", layout="centered", initial_sidebar_state="collapsed")
 
-INDICATORS  = ['MTI', 'REC', 'RECON', 'ORC']
-ENSEMBLE_N  = 3
-SHEET_NAME  = "SKIM_Timeseries"
-KST         = pytz.timezone("Asia/Seoul")
-DIVERGENCE_THRESHOLD = 2.0  # τ_d
+ENSEMBLE_N           = 3
+SHEET_NAME           = "AIQ_Pilot"
+KST                  = pytz.timezone("Asia/Seoul")
+DIVERGENCE_THRESHOLD = 1.5  # 앙상블 std_dev 임계값 — 초과 시 low_reliability 플래그
 
-# ─── Tab 3개로 축소 ───
-tab_analyze, tab_inflection, tab_info = st.tabs([
-    "🔬 분석", "🔍 변곡점 정밀 분석", "📋 CRP info"
-])
+# ─────────────────────────────────────────────
+# AIQ 20문항 정의 (VF1 확정본)
+# ─────────────────────────────────────────────
+QUESTIONS = [
+    # (번호, 텍스트, 유형, 역방향여부)
+    (1,  "AI에게 질문을 보내기 전에 내가 원하는 결과를 먼저 정의한다",        "설계자", False),
+    (2,  "AI가 답을 주면 그 흐름에 맞춰 대화를 이어간다",                     "의존",   False),
+    (3,  "AI가 새로운 시각을 제시해도 내 기존 생각을 쉽게 바꾸지 않는다",     "상상가", True),
+    (4,  "AI의 지시나 제안을 최대한 빠르게 실행에 옮긴다",                     "실행",   False),
+    (5,  "AI 대화에서 내가 놓친 전제나 조건을 스스로 되짚어본다",              "설계자", False),
+    (6,  "AI가 틀려도 그 답을 기준으로 판단하는 경우가 있다",                  "의존",   False),
+    (7,  "AI가 제안한 방향보다 내 아이디어로 대화를 이끌고 싶다",              "상상가", False),
+    (8,  "AI 결과물은 내 기준에 맞게 반드시 수정해서 사용한다",                "설계자", True),
+    (9,  "AI가 준 내용을 다른 도구나 방법과 결합해 바로 적용한다",             "실행",   False),
+    (10, "AI와 대화하면서 예상치 못한 연결을 발견하는 것이 즐겁다",            "상상가", False),
+    (11, "AI가 제안한 방식이 내 방식보다 낫다고 느끼면 그냥 따른다",           "의존",   False),
+    (12, "AI가 내 질문 의도를 잘못 이해했을 때 즉시 교정 질문을 보낸다",       "설계자", False),
+    (13, "AI 결과를 받으면 바로 적용하기보다 한 번 더 확인한다",               "실행",   True),
+    (14, "AI와 대화하다 보면 처음 생각지 못한 가능성이 머릿속에 펼쳐진다",     "상상가", False),
+    (15, "AI를 쓸 때 내가 원하는 출력 형식을 명시적으로 지정한다",             "설계자", False),
+    (16, "AI가 준 단계별 지시를 순서대로 따라가는 것이 효율적이라고 생각한다", "실행",   False),
+    (17, "AI와 대화할 때 '만약 ~라면'처럼 가정을 많이 사용한다",              "상상가", False),
+    (18, "AI 결과가 마음에 들지 않으면 다시 시도하기보다 그냥 쓴다",           "의존",   True),
+    (19, "AI가 준 코드나 템플릿을 즉시 실행해보며 결과를 확인한다",            "실행",   False),
+    (20, "AI 없이 스스로 문제를 해결하는 것이 부담스럽다",                     "의존",   False),
+]
 
-with tab_info:
-    components.html(open("landing.html", encoding="utf-8").read(), height=920)
+TYPE_LABELS = {
+    "설계자": "설계자형",
+    "상상가": "상상가형",
+    "실행":   "실행형",
+    "의존":   "의존형",
+}
 
+TYPE_AXIS = {
+    "설계자형": ("QLI↑", "CRP↑"),
+    "상상가형": ("QLI↑", "CRP↓"),
+    "실행형":   ("QLI↓", "CRP↑"),
+    "의존형":   ("QLI↓", "CRP↓"),
+}
+
+TYPE_DESC = {
+    "설계자형": "AI를 도구로 부리는 사람. 질문 전에 목적을 정의하고, 결과를 받으면 재조립한다.",
+    "상상가형": "질문 수준은 높지만 결과를 재구성하는 데 어려움이 있다. 아이디어가 풍부하고 실행이 약하다.",
+    "실행형":   "AI 지시를 빠르게 실행하는 패턴이 우세하다. 구조보다 속도를 선택하는 경향이 있다.",
+    "의존형":   "AI 출력에 의존도가 높다. 자기 검증이 낮으며 사고 역량 강화가 필요하다.",
+}
+
+# ─────────────────────────────────────────────
+# Topic 1 · 2 시나리오 정의
+# ─────────────────────────────────────────────
+TOPIC1_SCENARIO = """당신은 어떤 일을 시작할지 말지 고민 중이다. 믿을 만한 두 사람에게 의견을 구했더니, 한 사람은 "지금이 적기다, 바로 해라"라고 하고, 다른 한 사람은 "지금은 때가 아니다, 기다려라"라고 한다. 두 사람 다 당신을 잘 알고, 둘 다 진심으로 조언하고 있다. 어느 쪽 말도 무시하기 어렵다.
+
+이 상황에서 무엇을 먼저 따져보고 싶은지, AI와 대화하며 정리해 보세요."""
+
+TOPIC2_SCENARIO = """친구가 다음 주 주말에 자기 일을 좀 도와달라고 부탁했고, 당신은 그러기로 했다. 그런데 약속 후에 알게 된 사실이 있다. 그 주말은 당신에게도 중요한 일이 있는 날이었다. 친구는 당신이 도와줄 거라 믿고 이미 다른 준비를 시작했다.
+
+이 상황을 어떻게 풀어갈지, AI와 대화하며 생각을 전개해 보세요."""
+
+TOPIC1_AI_FIRST = "안녕하세요. 이 상황에 대해 가장 먼저 떠오르는 것을 편하게 말해보세요."
+TOPIC2_AI_FIRST = "안녕하세요. 이 상황, 어떻게 풀면 좋을지 편하게 말해보세요."
+
+TOPIC2_CONDITION_INJECT = "그런데 친구가 부탁한 그 일이, 사실 당신이 아니어도 할 수 있는 일이라면 어떨까요? 친구가 굳이 당신에게 부탁한 이유가 따로 있을 수도 있는데요."
 
 # ─────────────────────────────────────────────
 # 유틸
 # ─────────────────────────────────────────────
-
 def normalize_score(v: float) -> float:
-    if v > 100:
-        v = v / 10
-    elif v > 10:
-        v = v / 10
+    if v > 100: v = v / 10
+    elif v > 10: v = v / 10
     return max(1.0, min(10.0, round(v, 2)))
 
 
-def parse_response(text: str) -> tuple[list[float], str, str]:
-    data_match = re.search(r"\[DATA\](.*?)\[INSIGHT_KO\]", text, re.S | re.I)
-    if not data_match:
-        raise ValueError("응답에서 [DATA]...[INSIGHT_KO] 구조를 찾을 수 없습니다.")
-    raw_vals = re.findall(
-        r"(?:MTI|REC|RECON|ORC)\s*:\s*(\d+\.?\d*)",
-        data_match.group(1), re.I
-    )
-    if len(raw_vals) < len(INDICATORS):
-        raise ValueError(f"지표 {len(INDICATORS)}개 필요, {len(raw_vals)}개만 파싱됨.")
-    scores = [normalize_score(float(v)) for v in raw_vals[:len(INDICATORS)]]
-
-    ko_match   = re.search(r"\[INSIGHT_KO\](.*?)\[INSIGHT_EN\]", text, re.S | re.I)
-    en_match   = re.search(r"\[INSIGHT_EN\](.*?)$",              text, re.S | re.I)
-    insight_ko = ko_match.group(1).strip() if ko_match else ""
-    insight_en = en_match.group(1).strip() if en_match else ""
-
-    if not insight_ko or not insight_en:
-        raise ValueError("INSIGHT_KO 또는 INSIGHT_EN 섹션이 비어 있습니다.")
-    return scores, insight_ko, insight_en
+def compute_type_scores(answers: dict) -> dict:
+    """20문항 응답 → 유형별 점수 산출"""
+    scores = {"설계자": 0, "상상가": 0, "실행": 0, "의존": 0}
+    for (no, text, typ, reverse) in QUESTIONS:
+        val = answers.get(no, 2)
+        if reverse:
+            val = 5 - val  # 역산
+        scores[typ] += val
+    return scores
 
 
-# ─────────────────────────────────────────────
-# MTI 레이어 불일치 자기진단
-# ─────────────────────────────────────────────
+def compute_top_types(type_scores: dict) -> tuple[str, str]:
+    """1순위·2순위 유형 반환"""
+    sorted_types = sorted(type_scores.items(), key=lambda x: x[1], reverse=True)
+    t1 = TYPE_LABELS[sorted_types[0][0]]
+    t2 = TYPE_LABELS[sorted_types[1][0]]
+    return t1, t2
 
-def diagnose_layer_divergence(scores_list: list[list[float]]) -> dict | None:
-    if len(scores_list) < 3:
-        return None
-    l1, l2, l3 = scores_list[0][0], scores_list[1][0], scores_list[2][0]
-    divergence  = max(l1, l2, l3) - min(l1, l2, l3)
 
-    if divergence <= DIVERGENCE_THRESHOLD:
-        return {"divergence": divergence, "flag": False,
-                "type": "-", "message": "레이어 간 편차 정상 범위"}
-
-    if l1 < l2 and l1 < l3:
-        diag_type = "L1 낮음 · L2 높음"
-        message   = "언어 패턴 풀 보완 필요 — 루브릭 Class 기준 재검토 권장"
-    elif l1 > l2 and l3 < l2:
-        diag_type = "L1 높음 · L3 낮음"
-        message   = "명시적 수정은 있으나 구조적 변화 없음 — 표면적 메타인지 가능성"
-    else:
-        diag_type = "L2 낮음 · L3 높음"
-        message   = "암묵적 패턴은 있으나 LLM 판단 미포착 — 루브릭 보정 필요"
-
-    return {"divergence": divergence, "flag": True,
-            "type": diag_type, "message": message}
+def compute_aiq_index(qli: float, recon: float) -> int:
+    """AIQ 지수 = 100 기준 0~200 (기하평균 잠정 공식)"""
+    combined = (qli * recon) ** 0.5
+    index = 100 + (combined - 5.0) * 20
+    return max(0, min(200, round(index)))
 
 
 # ─────────────────────────────────────────────
-# [v6.3 추가] 변곡점 delta 사전 계산
+# Google Sheets 연동
 # ─────────────────────────────────────────────
-
-def compute_pivot_differential(data: pd.DataFrame, pivot_row: pd.Series) -> dict:
-    """
-    변곡점 행을 기준으로 delta·낙폭 순위·MTI trait 안정 여부를 사전 계산.
-    LLM에게 수치 해석을 위임하지 않고 구조화된 근거로 입력한다.
-    """
-    metrics = ["MTI", "Rec", "Recon", "Orc"]
-
-    prior = data[data["timestamp"] < pivot_row["timestamp"]]
-    if prior.empty:
-        baseline = {m: float(pivot_row[m]) for m in metrics}
-    else:
-        # velocity = momentum[t] - momentum[t-1] (직전 세션 기준)
-        # delta 기준도 직전 세션으로 통일해야 방향이 일치함
-        # peak 기준을 쓰면 JUMP 직전에 고점이 있을 때 delta가 0/-로 역전됨
-        prev_row = prior.iloc[-1]
-        baseline = {m: float(prev_row[m]) for m in metrics}
-
-    current = {m: float(pivot_row[m]) for m in metrics}
-    deltas  = {m: round(current[m] - baseline[m], 2) for m in metrics}
-
-    sorted_by_drop = sorted(metrics, key=lambda m: deltas[m])
-    delta_ranks    = {m: sorted_by_drop.index(m) + 1 for m in metrics}
-    avg_delta      = round(sum(deltas.values()) / len(metrics), 2)
-    mti_trait_stable = deltas["MTI"] > avg_delta
-
-    mti_v, recon_v, orc_v, rec_v = (
-        current["MTI"], current["Recon"], current["Orc"], current["Rec"]
-    )
-    if mti_v >= 6.5 and recon_v < 6.0:
-        class_hint = "확산집중형"
-    elif orc_v >= 7.0 and rec_v >= 7.0 and mti_v < 6.5:
-        class_hint = "실행편중형"
-    elif mti_trait_stable and deltas["Recon"] < -2.0:
-        class_hint = "인지포화형"
-    elif max(current.values()) - min(current.values()) < 1.5:
-        class_hint = "균형성장형"
-    else:
-        class_hint = "판단보류"
-
-    return {
-        "current":          current,
-        "baseline":         baseline,
-        "deltas":           deltas,
-        "delta_ranks":      delta_ranks,
-        "avg_delta":        avg_delta,
-        "mti_trait_stable": mti_trait_stable,
-        "max_drop_metric":  sorted_by_drop[0],
-        "min_drop_metric":  sorted_by_drop[-1],
-        "class_hint":       class_hint,
-    }
-
-
-# ─────────────────────────────────────────────
-# Google Sheets
-# ─────────────────────────────────────────────
+#
+# ▼ 개발노트 ──────────────────────────────────
+#
+# 스프레드시트 이름: "AIQ_Pilot" (st.secrets["gcp_service_account"] 서비스 계정 공유 필요)
+#
+# ─── 2개 워크시트 분리 구조 (v8.3~) ───
+#
+# 식별 정보와 진단 결과를 시트로 분리한다. 두 시트는 'serial' 컬럼으로 조인된다.
+# 분리 목적: 식별 정보 노출 최소화, 향후 데이터 분석 시 익명 데이터 분리 추출 용이.
+#
+# ─── 시트 1: "participants" — 식별 정보 (컬럼 5개) ───
+#
+#  1. serial           — #2026_000001 형식의 자동 채번 ID
+#  2. timestamp        — KST 응답 완료 시각 (YYYY-MM-DD HH:MM:SS KST)
+#  3. name             — 응답자 이름 (2~20자, 한글/영문)
+#  4. birth            — 생년월일 YYYYMMDD 8자리
+#  5. consent          — 동의 여부 (Y, 미동의 시 진행 불가하므로 항상 Y)
+#
+# ─── 시트 2: "responses" — 진단 결과 (컬럼 15개) ───
+#
+#  1. serial           — participants 시트의 serial과 매칭
+#  2. timestamp        — KST 응답 완료 시각 (위와 동일)
+#
+#  ─── 1단계: 유형 진단 (20문항) ───
+#  3. type1            — 1순위 유형 (설계자형/상상가형/실행형/의존형)
+#  4. type2            — 2순위 유형
+#  5. score_designer   — 설계자형 점수 (5~20, 역방향 Q08 역산 적용)
+#  6. score_imaginer   — 상상가형 점수 (5~20, 역방향 Q03 역산 적용)
+#  7. score_executor   — 실행형 점수   (5~20, 역방향 Q13 역산 적용)
+#  8. score_follower   — 의존형 점수   (5~20, 역방향 Q18 역산 적용)
+#
+#  ─── 2단계: 시나리오 측정 (앙상블 3회 평균) ───
+#  9. QLI              — 질문 설계력 (LP·BF·AE 기하평균, 1~10)
+# 10. Recon            — 재구성력   (1~10)
+# 11. MTI              — 사고 전환  (3-Layer 가중합, 1~10)
+# 12. AIQ_index        — AIQ 지수 (100 기준 0~200, 잠정 환산)
+# 13. class_s          — Class S(문제 재정의) 발생 여부 (Y/N)
+#
+#  ─── 원자료 (분석 재현용) ───
+# 14. q_answers        — 20문항 응답 dict 문자열 {1:2, 2:3, ...}
+# 15. log_topic1       — Topic 1 대화 로그 (role·content 리스트 문자열)
+# 16. log_topic2       — Topic 2 대화 로그 (role·content 리스트 문자열)
+#
+# ─── 자동 채번 메커니즘 ───
+#
+# • 채번 시점: 진단 완료 시(save_result 호출 시점) — 중도 이탈자는 번호 미부여
+# • 채번 방식: participants 시트에 append_row 호출 후 응답의 updatedRange에서
+#   행 번호를 파싱 → serial 구성. Google Sheets API의 append가 원자적이므로
+#   동시 진입자가 있어도 시리얼 중복 없음.
+# • 형식: #2026_000001 ~ #2026_999999 (6자리 패딩)
+# • 헤더 행(1행)을 제외하므로 실제 데이터 행 번호 = 시리얼 번호 + 1
+#
+# ─── 마이그레이션 주의사항 ───
+#
+# • v8.2에서 v8.3으로 올라온 경우: 기존 responses 시트 컬럼 구조가 다르므로
+#   자동 호환되지 않는다. 다음 중 하나 필요:
+#   (a) 기존 데이터 백업 후 responses·participants 시트 모두 삭제
+#   (b) 새 스프레드시트로 시작
+#
+# • 새 컬럼 추가 시: 헤더 리스트와 append_row 데이터 순서 일치시킬 것
+#
+# • AIQ_index 환산 공식이 바뀌면(파일럿 캘리브레이션 후): compute_aiq_index() 수정.
+#   기존 저장값은 잠정 공식 결과이므로 재계산이 필요할 수 있다.
+#
+# • 채점 LLM 응답이 파싱 실패하면 run_scoring()이 fallback 5.0을 반환하므로,
+#   QLI/Recon/MTI가 정확히 5.00·5.00·5.00이고 scoring_failed=Y이면 파싱 실패.
+#
+# ────────────────────────────────────────────
 
 @st.cache_resource
 def get_gsheet_client():
@@ -169,620 +222,773 @@ def get_gsheet_client():
     return gspread.authorize(creds)
 
 
-def get_worksheet(u_id: str):
-    gc = get_gsheet_client()
-    ss = gc.open(SHEET_NAME)
+def save_result(name: str, birth: str, type1: str, type2: str, type_scores: dict,
+                qli: float, recon: float, mti: float, aiq: int,
+                has_class_s: bool, answers: dict,
+                log_t1: list, log_t2: list,
+                scoring_failed: bool = False) -> str | None:
+    """
+    진단 결과를 Google Sheets에 저장하고 자동 채번된 serial을 반환한다.
+
+    동시성 안전 채번:
+      participants 시트에 append_row 호출 → 응답의 updatedRange에서 행 번호 파싱
+      → "#2026_NNNNNN" 형식의 serial 생성. Google Sheets API의 append가 원자적이므로
+      동시 진입자가 있어도 같은 serial이 부여될 수 없음.
+
+    반환값:
+      성공: "#2026_000001" 같은 serial 문자열
+      실패: None (저장 오류 시)
+    """
     try:
-        ws = ss.worksheet(u_id)
-    except gspread.WorksheetNotFound:
+        gc = get_gsheet_client()
+        ss = gc.open(SHEET_NAME)
+        ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+
+        # ─── 1) participants 시트에 append (채번) ───
         try:
-            ws = ss.add_worksheet(title=u_id, rows=1000, cols=20)
-            ws.append_row(["timestamp", "MTI", "Rec", "Recon", "Orc", "insight_summary"])
-        except Exception:
-            # 동시 생성 또는 이미 존재하는 경우 재시도
-            ws = ss.worksheet(u_id)
-    return ws
+            ws_p = ss.worksheet("participants")
+        except gspread.WorksheetNotFound:
+            ws_p = ss.add_worksheet(title="participants", rows=5000, cols=10)
+            ws_p.append_row(["serial", "timestamp", "name", "birth", "consent"])
 
-
-def save_timeseries(u_id: str, avg: pd.Series, insight_ko: str) -> None:
-    ws = get_worksheet(u_id)
-    ws.append_row([
-        datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
-        round(float(avg["MTI"]),   2), round(float(avg["Rec"]),   2),
-        round(float(avg["Recon"]), 2), round(float(avg["Orc"]),   2),
-        insight_ko[:350] + ("..." if len(insight_ko) > 350 else "")
-    ])
-
-
-def load_timeseries(u_id: str) -> pd.DataFrame | None:
-    try:
-        ws  = get_worksheet(u_id)
-        rec = ws.get_all_records(expected_headers=[
-            "timestamp", "MTI", "Rec", "Recon", "Orc", "insight_summary"
-        ])
-        if not rec:
-            return None
-        df = pd.DataFrame(rec)
-        df["timestamp"] = pd.to_datetime(
-            df["timestamp"].str.replace(" KST", "", regex=False)
+        # append_row 호출 — 응답에서 updatedRange를 받아 행 번호 추출
+        # placeholder로 빈 serial 자리를 두고 append → 그 행 번호로 serial 만든 뒤 update
+        result = ws_p.append_row(
+            ["", ts, name, birth, "Y"],
+            value_input_option="RAW",
+            include_values_in_response=False
         )
-        return df.sort_values("timestamp").reset_index(drop=True)
+        # result['updates']['updatedRange'] 예: "participants!A6:E6"
+        updated_range = result.get("updates", {}).get("updatedRange", "")
+        m = re.search(r"!\w+(\d+):", updated_range)
+        if not m:
+            # 파싱 실패 시 fallback — 전체 행 수 사용 (덜 안전하지만 동작은 함)
+            row_num = len(ws_p.get_all_values())
+        else:
+            row_num = int(m.group(1))
+
+        serial_num = row_num - 1  # 헤더 행(1행) 제외
+        serial = f"#2026_{serial_num:06d}"
+
+        # 빈 serial 셀에 실제 값 기록
+        ws_p.update_cell(row_num, 1, serial)
+
+        # ─── 2) responses 시트에 append ───
+        try:
+            ws_r = ss.worksheet("responses")
+        except gspread.WorksheetNotFound:
+            ws_r = ss.add_worksheet(title="responses", rows=5000, cols=20)
+            ws_r.append_row([
+                "serial", "timestamp",
+                "type1", "type2",
+                "score_designer", "score_imaginer", "score_executor", "score_follower",
+                "QLI", "Recon", "MTI", "AIQ_index", "class_s",
+                "q_answers", "log_topic1", "log_topic2"
+            ])
+        ws_r.append_row([
+            serial, ts,
+            type1, type2,
+            type_scores.get("설계자", 0), type_scores.get("상상가", 0),
+            type_scores.get("실행", 0), type_scores.get("의존", 0),
+            round(qli, 2), round(recon, 2), round(mti, 2), aiq,
+            "Y" if has_class_s else "N",
+            str(answers),
+            str(log_t1),
+            str(log_t2)
+        ])
+        return serial
     except Exception as e:
-        st.error(f"데이터 로드 오류: {e}")
+        st.warning(f"저장 오류: {e}")
         return None
 
 
 # ─────────────────────────────────────────────
-# PDF 생성
+# AI 대화 응답 생성
 # ─────────────────────────────────────────────
+def get_ai_response(messages: list, topic: int) -> str:
+    """Topic 1·2 대화 진행 AI 응답"""
+    system = (
+        "당신은 AIQ 진단 시스템의 대화 진행자입니다. "
+        "응답자의 생각을 끌어내되 답을 유도하거나 평가하지 마십시오. "
+        "짧고 자연스럽게 이어지도록 하십시오(2~3문장 이하). "
+        "정답이 있는 것처럼 느끼게 하지 마십시오."
+    )
+    # Topic 2 조건 투입 — 응답자가 판단을 세운 뒤 1회만 (t2_injected 플래그 활용)
+    inject_condition = (
+        topic == 2
+        and len(messages) >= 3
+        and not st.session_state.get("t2_injected", False)
+    )
+    if inject_condition:
+        system += (
+            "\n\n[중요] 응답자가 어떤 입장이나 판단을 세웠다면, "
+            "이번 응답에 다음 조건을 자연스러운 흐름으로 한 번만 삽입하십시오: "
+            f"'{TOPIC2_CONDITION_INJECT}'"
+        )
+        st.session_state.t2_injected = True
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "system", "content": system}] + messages,
+        temperature=0.3,
+        max_tokens=150
+    )
+    return resp.choices[0].message.content.strip()
 
-def _ascii_bar(score: float, width: int = 20) -> str:
-    filled = round(score / 10 * width)
-    return f"[{'#' * filled}{'.' * (width - filled)}] {score:.2f}"
+
+# ─────────────────────────────────────────────
+# QLI·MTI·Recon 채점 (앙상블 3회)
+# ─────────────────────────────────────────────
+RUBRIC_SYSTEM = """You are an AIQ diagnostic scoring system. Score the following conversation logs.
+
+SCORING RUBRIC:
+
+QLI (Question Logic Index) = geometric mean of LP · BF · AE (each 1-10):
+  LP (Logical Precision — 논리 정밀도):
+    9-10: Explicitly states conditions, premises, constraints
+    7-8: Mostly precise but some vagueness
+    5-6: Moderate structure
+    3-4: Loose, informal
+    1-2: Simple information request only
+  BF (Breadth Factor — 범위 확장도):
+    9-10: Multiple paths, diverse sub-questions explored
+    7-8: Some branching attempted
+    5-6: Moderate exploration
+    3-4: Minimal branching
+    1-2: No expansion
+  AE (Abstraction Elevation — 추상도 수준):
+    9-10: Questions underlying principles, challenges premises
+    7-8: Moves toward abstraction partially
+    5-6: Mixed concrete and abstract
+    3-4: Mostly concrete
+    1-2: Purely factual/confirmatory
+
+MTI (Meta-cognitive Tension Index) — 1-10 score (NOT a grade):
+  Uses 3-Layer weighted formula: L1×0.60 + L2×0.25 + L3×0.15
+  L1 weights: self-negation(A)×3 + strategy revision(B)×2 + reflection(C)×1, normalized 1-10
+  Apply speed bonus: multiply by (1 + 1/turns_to_transition) if Class A detected
+  L2: quality of monitoring (1-10)
+  L3: implicit contextual reasoning (1-10)
+  Class S detected (problem reframing "this is not X but Y"): add flag
+
+Recon (Reconfiguration) — 1-10:
+  9-10: Creates new logical structure, extends beyond AI output
+  7-8: Integrates and attempts synthesis
+  5-6: Lists ideas without integration
+  3-4: Repeats pattern without reassembly
+  1-2: Copies AI output directly
+
+Output ONLY this format:
+[SCORES]
+LP: <1-10>
+BF: <1-10>
+AE: <1-10>
+QLI: <geometric mean, 1-10>
+MTI: <1-10>
+Recon: <1-10>
+ClassS: <YES/NO>
+[INSIGHT_KO]
+<3문장 이내. 질문 구조·사고 전환·재구성 관점에서 관찰된 사실만 서술. 권고·평가 금지.>
+"""
+
+def parse_aiq_scores(text: str) -> dict | None:
+    """채점 응답 파싱"""
+    try:
+        lp    = float(re.search(r"LP\s*:\s*([\d.]+)", text, re.I).group(1))
+        bf    = float(re.search(r"BF\s*:\s*([\d.]+)", text, re.I).group(1))
+        ae    = float(re.search(r"AE\s*:\s*([\d.]+)", text, re.I).group(1))
+        qli   = float(re.search(r"QLI\s*:\s*([\d.]+)", text, re.I).group(1))
+        mti   = float(re.search(r"MTI\s*:\s*([\d.]+)", text, re.I).group(1))
+        recon = float(re.search(r"Recon\s*:\s*([\d.]+)", text, re.I).group(1))
+        cs    = bool(re.search(r"ClassS\s*:\s*YES", text, re.I))
+        ko_m  = re.search(r"\[INSIGHT_KO\](.*?)$", text, re.S | re.I)
+        ko    = ko_m.group(1).strip() if ko_m else ""
+        return {
+            "LP": normalize_score(lp), "BF": normalize_score(bf),
+            "AE": normalize_score(ae), "QLI": normalize_score(qli),
+            "MTI": normalize_score(mti), "Recon": normalize_score(recon),
+            "ClassS": cs, "insight_ko": ko
+        }
+    except Exception:
+        return None
 
 
-def _safe(text: str) -> str:
-    return text.encode("latin1", errors="ignore").decode("latin1")
+def run_scoring(log_t1: list, log_t2: list) -> dict:
+    """앙상블 3회 채점 → 평균 반환"""
+    log_t1_text = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in log_t1])
+    log_t2_text = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in log_t2])
+    user_prompt = (
+        f"[Topic 1 — 질문 구조 측정]\n{log_t1_text}\n\n"
+        f"[Topic 2 — 사고 전환 측정]\n{log_t2_text}"
+    )
+    results = []
+    for _ in range(ENSEMBLE_N):
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": RUBRIC_SYSTEM},
+                    {"role": "user",   "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=400
+            )
+            parsed = parse_aiq_scores(resp.choices[0].message.content)
+            if parsed:
+                results.append(parsed)
+        except Exception:
+            pass
+
+    if not results:
+        # 채점 전면 실패 — 신뢰도 0, fallback 5.0
+        return {
+            "QLI": 5.0, "MTI": 5.0, "Recon": 5.0,
+            "ClassS": False,
+            "insight_ko": "채점 오류 — LLM 응답 파싱 실패. 로그를 검토 후 재채점이 필요합니다.",
+            "low_reliability": True,
+            "scoring_failed": True
+        }
+
+    avg_qli   = round(sum(r["QLI"]   for r in results) / len(results), 2)
+    avg_mti   = round(sum(r["MTI"]   for r in results) / len(results), 2)
+    avg_recon = round(sum(r["Recon"] for r in results) / len(results), 2)
+    has_cs    = any(r["ClassS"] for r in results)
+    insight   = results[0]["insight_ko"]
+
+    std_mti = (sum((r["MTI"] - avg_mti) ** 2 for r in results) / len(results)) ** 0.5
+    low_reliability = std_mti > DIVERGENCE_THRESHOLD
+
+    return {
+        "QLI": avg_qli, "MTI": avg_mti, "Recon": avg_recon,
+        "ClassS": has_cs, "insight_ko": insight,
+        "low_reliability": low_reliability,
+        "scoring_failed": False
+    }
 
 
-def create_ensemble_pdf(insight_en: str, u_id: str, time: str,
-                        avg: pd.Series) -> bytes:
-    pdf = FPDF()
-    pdf.add_page()
-    W = pdf.w - pdf.l_margin - pdf.r_margin
+# ─────────────────────────────────────────────
+# CSS
+# ─────────────────────────────────────────────
+st.markdown("""
+<style>
+    .stApp { max-width: 780px; margin: 0 auto; }
+    .step-bar { display: flex; align-items: center; gap: 0;
+                padding: 0.6rem 0; margin-bottom: 1.5rem;
+                border-bottom: 1px solid #e5e7eb; }
+    .step-item { display: flex; align-items: center; gap: 6px; flex: 1; }
+    .step-num  { width: 22px; height: 22px; border-radius: 50%;
+                 display: flex; align-items: center; justify-content: center;
+                 font-size: 11px; font-weight: 600; }
+    .step-on   { background: #EBF4FF; color: #1D6FA8; border: 1.5px solid #93C5FD; }
+    .step-done { background: #ECFDF5; color: #065F46; border: 1.5px solid #6EE7B7; }
+    .step-off  { background: #F9FAFB; color: #9CA3AF; border: 1px solid #E5E7EB; }
+    .step-lbl-on   { font-size: 12px; font-weight: 600; color: #111827; }
+    .step-lbl-off  { font-size: 12px; color: #9CA3AF; }
+    .step-div  { flex: none; width: 20px; height: 1px; background: #E5E7EB; margin: 0 2px; }
+    .scn-box   { background: #F0F7FF; border-left: 3px solid #3B82F6;
+                 border-radius: 6px; padding: 1rem 1.2rem; margin-bottom: 1rem; }
+    .scn-title { font-size: 11px; font-weight: 600; color: #6B7280;
+                 text-transform: uppercase; letter-spacing: .06em; margin-bottom: .4rem; }
+    .scn-text  { font-size: 14px; color: #111827; line-height: 1.7; margin: 0; }
+    .topic-tag { display: inline-block; font-size: 11px; font-weight: 600;
+                 padding: 2px 9px; border-radius: 4px; margin-bottom: 0.6rem; }
+    .t1-tag    { background: #ECFDF5; color: #065F46; border: 1px solid #6EE7B7; }
+    .t2-tag    { background: #FFFBEB; color: #92400E; border: 1px solid #FCD34D; }
+    .coord-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 0.75rem 0; }
+    .cc        { border: 1px solid #E5E7EB; border-radius: 6px;
+                 padding: 8px 10px; font-size: 12px; background: #F9FAFB; }
+    .cc-hl     { background: #EBF4FF; border-color: #93C5FD; }
+    .cc-name   { font-weight: 600; font-size: 13px; display: block; color: #111827; }
+    .cc-tag    { font-size: 11px; color: #6B7280; }
+    .cc-hl .cc-name { color: #1D6FA8; }
+    .interp    { background: #F9FAFB; border: 1px solid #E5E7EB; border-radius: 6px;
+                 padding: 0.75rem 1rem; font-size: 13px; color: #374151; line-height: 1.6; }
 
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 12, "Sobaekhyeon CRP Cognitive Report", ln=True, align="C")
-    pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 5,
-             f"ID: {_safe(u_id)}   |   Date: {_safe(time)}   |   Ensemble N={ENSEMBLE_N}",
-             ln=True, align="C")
-    pdf.ln(4)
-    pdf.set_draw_color(180, 180, 180)
-    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
-    pdf.ln(6)
+    /* ─── 결과 리포트 (v8.1) ─── */
+    .report-header { border-bottom: 2px solid #1F3864; padding-bottom: 0.85rem; margin-bottom: 1.5rem; }
+    .report-title  { font-size: 11px; font-weight: 600; color: #1D6FA8;
+                     letter-spacing: 0.15em; text-transform: uppercase; margin: 0 0 0.25rem; }
+    .report-name   { font-size: 22px; font-weight: 500; color: #111827; margin: 0 0 0.5rem; }
+    .report-meta   { display: flex; gap: 1.5rem; font-size: 12px; color: #6B7280; flex-wrap: wrap; }
+    .report-meta span strong { color: #374151; font-weight: 500; margin-right: 0.25rem; }
 
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, "[ Core Indicators ]", ln=True)
-    pdf.set_font("Courier", "", 10)
-    for k in ["MTI", "Rec", "Recon", "Orc"]:
-        if k in avg:
-            pdf.cell(0, 7, f"  {k:<6} {_ascii_bar(avg[k])}", ln=True)
-    pdf.ln(4)
-    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
-    pdf.ln(6)
+    .aiq-hero      { text-align: center; padding: 2.5rem 1rem 2rem;
+                     background: linear-gradient(180deg, #F0F7FF 0%, #FFFFFF 100%);
+                     border-radius: 12px; margin: 0 0 1.5rem; border: 1px solid #DBEAFE; }
+    .aiq-label     { font-size: 13px; font-weight: 500; color: #6B7280;
+                     letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 0.5rem; }
+    .aiq-value     { font-size: 96px; font-weight: 300; color: #1D6FA8;
+                     line-height: 1; margin: 0; letter-spacing: -2px; }
+    .aiq-badge-row { margin-top: 0.75rem; display: flex; justify-content: center;
+                     gap: 8px; align-items: center; flex-wrap: wrap; }
+    .aiq-badge     { font-size: 11px; font-weight: 500; color: #1D6FA8;
+                     background: #DBEAFE; padding: 3px 10px; border-radius: 4px; }
 
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, "[ Expert Insight ]", ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(0, 6, txt=_safe(insight_en))
-    pdf.ln(4)
-    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + W, pdf.get_y())
+    .section-title { font-size: 24px; font-weight: 500; color: #111827; margin: 1rem 0 0.25rem; }
+    .axis-tag      { font-size: 13px; color: #6B7280; margin: 0 0 0.75rem; }
+    .type-quote    { border-left: 3px solid #D1D5DB; padding: 0 0 0 1rem;
+                     margin: 0.5rem 0 1.5rem; color: #4B5563; font-size: 13px; line-height: 1.7; }
 
-    pdf.set_font("Helvetica", "", 8)
-    pdf.set_text_color(160, 160, 160)
-    pdf.cell(0, 10, "Sobaekhyeon CRP  |  v6.1  |  Confidential",
-             ln=True, align="C")
+    .sub-section-title { font-size: 13px; font-weight: 600; color: #6B7280;
+                         margin: 0 0 0.75rem; letter-spacing: 0.04em; text-transform: uppercase; }
 
-    pdf_out = pdf.output(dest="S")
-    if isinstance(pdf_out, bytes):
-        return pdf_out
-    elif isinstance(pdf_out, bytearray):
-        return bytes(pdf_out)
+    .sub-metrics { display: grid; grid-template-columns: repeat(3, 1fr);
+                   gap: 0; margin: 0.75rem 0; }
+    .sm          { padding: 0.5rem 0.7rem; }
+    .sm-divider  { border-right: 1px solid #E5E7EB; }
+    .sm-lbl      { font-size: 10px; color: #9CA3AF; margin: 0 0 2px; letter-spacing: 0.03em; }
+    .sm-val      { font-size: 14px; font-weight: 500; color: #4B5563; margin: 0; }
+
+    .second-rank { font-size: 12px; color: #6B7280; margin-top: 0.5rem; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+# session_state 초기화
+# ─────────────────────────────────────────────
+def init_state():
+    defaults = {
+        "stage":          0,       # 0=진입 1=유형진단 2=Topic1 3=Topic2 4=결과
+        "answers":        {},      # {문항번호: 점수}
+        "type_scores":    {},
+        "type1":          "",
+        "type2":          "",
+        "chat_t1":        [],
+        "chat_t2":        [],
+        "t1_turns":       0,
+        "t2_turns":       0,
+        "t2_injected":    False,   # Topic 2 조건 투입 여부 (1회 제한)
+        "scores":         {},      # 채점 결과
+        "aiq_index":      0,
+        # ─── v8.3 — 응답자 식별 ───
+        "user_name":      "",      # 이름
+        "user_birth":     "",      # 생년월일 YYYYMMDD 8자리
+        "consent_given":  False,   # 개인정보 수집 동의
+        "user_serial":    "",      # 자동 채번된 #2026_NNNNNN (진단 완료 후 부여)
+        "saved":          False,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
+
+
+# ─────────────────────────────────────────────
+# 단계 표시 바
+# ─────────────────────────────────────────────
+def step_bar(current: int):
+    steps = [
+        (1, "유형 진단"),
+        (2, "시나리오 A"),
+        (3, "시나리오 B"),
+        (4, "결과"),
+    ]
+    html = '<div class="step-bar">'
+    for i, (num, label) in enumerate(steps):
+        if num < current:
+            cls_n, cls_l = "step-num step-done", "step-lbl-off"
+            icon = "✓"
+        elif num == current:
+            cls_n, cls_l = "step-num step-on", "step-lbl-on"
+            icon = str(num)
+        else:
+            cls_n, cls_l = "step-num step-off", "step-lbl-off"
+            icon = str(num)
+        html += f'<div class="step-item"><div class="{cls_n}">{icon}</div><span class="{cls_l}">{label}</span></div>'
+        if i < len(steps) - 1:
+            html += '<div class="step-div"></div>'
+    html += '</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+# 1단계: 유형 진단 (20문항)
+# ─────────────────────────────────────────────
+def stage_1():
+    step_bar(1)
+    st.markdown("### AI와 나는 어떻게 함께 사고하는가")
+    st.caption("20개 행동 문항에 응답해주세요. 정답이 없으며 평소 습관을 기준으로 선택하세요.")
+    st.divider()
+
+    SCALE_LABELS = ["① 거의 안 한다", "② 가끔 한다", "③ 자주 한다", "④ 항상 한다"]
+
+    with st.form("q_form"):
+        answers = {}
+        for (no, text, typ, reverse) in QUESTIONS:
+            st.markdown(f"**Q{no:02d}.** {text}")
+            # 이전 응답이 있으면 그 값을, 없으면 None(미선택)으로 시작
+            prev = st.session_state.answers.get(no)
+            prev_index = (prev - 1) if prev else None
+            val = st.radio(
+                label=f"q{no}",
+                options=[1, 2, 3, 4],
+                format_func=lambda x: SCALE_LABELS[x - 1],
+                index=prev_index,                 # None이면 미선택 상태
+                horizontal=True,
+                label_visibility="collapsed",
+                key=f"q{no}"
+            )
+            answers[no] = val                      # val이 None이면 미응답
+            st.markdown("")
+
+        # 미응답 정확히 감지 (None 제외)
+        answered = len([v for v in answers.values() if v is not None])
+        st.caption(f"{answered} / 20 문항 완료")
+        submitted = st.form_submit_button("✅ 완료 — 시나리오로 이동", use_container_width=True)
+
+    if submitted:
+        # 미응답 문항이 하나라도 있으면 진행 차단
+        missing = [no for no, v in answers.items() if v is None]
+        if missing:
+            st.warning(f"아직 응답하지 않은 문항이 있습니다: Q{', Q'.join(f'{n:02d}' for n in missing)}")
+        else:
+            st.session_state.answers     = answers
+            st.session_state.type_scores = compute_type_scores(answers)
+            t1, t2 = compute_top_types(st.session_state.type_scores)
+            st.session_state.type1 = t1
+            st.session_state.type2 = t2
+            st.session_state.stage = 2
+            st.rerun()
+
+
+# ─────────────────────────────────────────────
+# 2단계-A: Topic 1 시나리오
+# ─────────────────────────────────────────────
+def stage_2():
+    step_bar(2)
+    st.markdown('<span class="topic-tag t1-tag">Topic 1 — 질문 수준 측정 · 최대 5턴</span>', unsafe_allow_html=True)
+    scn_html = TOPIC1_SCENARIO.replace("\n\n", "<br><br>").replace("\n", "<br>")
+    st.markdown(f'<div class="scn-box"><p class="scn-title">두 사람의 조언</p><p class="scn-text">{scn_html}</p></div>', unsafe_allow_html=True)
+    st.caption("정답이 없습니다. 어떻게 질문하고 판단을 전개하는지가 측정됩니다.")
+    st.divider()
+
+    # 첫 AI 발화 초기화
+    if not st.session_state.chat_t1:
+        st.session_state.chat_t1 = [
+            {"role": "assistant", "content": TOPIC1_AI_FIRST}
+        ]
+
+    # 대화 표시
+    for msg in st.session_state.chat_t1:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # 입력 (5턴 이하)
+    if st.session_state.t1_turns < 5:
+        user_input = st.chat_input(
+            placeholder="AI에게 질문하거나 생각을 입력하세요... (200자 이하)",
+            max_chars=200,
+            key="t1_input"
+        )
+        if user_input:
+            st.session_state.chat_t1.append({"role": "user", "content": user_input})
+            st.session_state.t1_turns += 1
+            ai_resp = get_ai_response(st.session_state.chat_t1, topic=1)
+            st.session_state.chat_t1.append({"role": "assistant", "content": ai_resp})
+            st.rerun()
     else:
-        return pdf_out.encode("latin1")
+        st.info("최대 턴 수(5턴)에 도달했습니다.")
+
+    st.divider()
+    st.caption(f"현재 {st.session_state.t1_turns} 턴 완료")
+
+    if st.button("다음 시나리오로 →", use_container_width=True, type="primary"):
+        st.session_state.stage = 3
+        st.rerun()
 
 
 # ─────────────────────────────────────────────
-# 학습자용 지표 해석
+# 2단계-B: Topic 2 시나리오
 # ─────────────────────────────────────────────
+def stage_3():
+    step_bar(3)
+    st.markdown('<span class="topic-tag t2-tag">Topic 2 — 사고 전환 측정 · 최대 7턴</span>', unsafe_allow_html=True)
+    scn_html = TOPIC2_SCENARIO.replace("\n\n", "<br><br>").replace("\n", "<br>")
+    st.markdown(f'<div class="scn-box"><p class="scn-title">친구의 부탁</p><p class="scn-text">{scn_html}</p></div>', unsafe_allow_html=True)
+    st.caption("정답이 없습니다. 판단을 어떻게 전개하고 수정하는지가 측정됩니다.")
+    st.divider()
 
-INDICATOR_GUIDE = {
-    "MTI": ("사고 전환", [
-        (1,  4,  "AI 출력을 그대로 수용하고 있어요. 사고의 방향이 외부에 의해 결정되고 있습니다."),
-        (4,  7,  "기존 논리를 수정하거나 관점을 바꾸려는 시도가 보여요."),
-        (7,  10, "스스로 사고의 방향을 바꾸고 있어요."),
-        (10, 11, "문제 자체를 재정의하는 수준의 사고 전환이 감지됩니다. (Class A+)")
-    ]),
-    "Rec": ("재인식", [
-        (1, 4,  "기존 지식을 새 맥락에 연결하기 어려워하고 있어요."),
-        (4, 7,  "알던 것을 다르게 볼 줄 알지만 아직 깊이가 붙고 있어요."),
-        (7, 11, "경험과 개념을 잘 연결해 재발견하고 있어요.")
-    ]),
-    "Recon": ("재구성", [
-        (1, 4,  "개념들을 하나의 구조로 엮는 데 연습이 필요해요."),
-        (4, 7,  "개념 간 연결 시도가 늘고 있어요."),
-        (7, 11, "여러 개념을 새로운 구조로 능동적으로 재조합하고 있어요.")
-    ]),
-    "Orc": ("인지 조율", [
-        (1, 4,  "사고 흐름을 스스로 조절하는 데 어려움이 있어요."),
-        (4, 7,  "흐름은 일정하지만 자기 조절이 아직 수동적이에요."),
-        (7, 11, "인지 자원을 전략적으로 배분하며 사고하고 있어요.")
-    ]),
-}
+    # 첫 AI 발화 초기화
+    if not st.session_state.chat_t2:
+        st.session_state.chat_t2 = [
+            {"role": "assistant", "content": TOPIC2_AI_FIRST}
+        ]
 
+    # 대화 표시
+    for msg in st.session_state.chat_t2:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-def get_indicator_comment(key: str, score: float) -> str:
-    for lo, hi, comment in INDICATOR_GUIDE[key][1]:
-        if lo <= score < hi:
-            return comment
-    return INDICATOR_GUIDE[key][1][-1][2]
+    # 입력 (7턴 이하)
+    if st.session_state.t2_turns < 7:
+        user_input = st.chat_input(
+            placeholder="AI에게 질문하거나 생각을 입력하세요... (200자 이하)",
+            max_chars=200,
+            key="t2_input"
+        )
+        if user_input:
+            st.session_state.chat_t2.append({"role": "user", "content": user_input})
+            st.session_state.t2_turns += 1
+            ai_resp = get_ai_response(st.session_state.chat_t2, topic=2)
+            st.session_state.chat_t2.append({"role": "assistant", "content": ai_resp})
+            st.rerun()
+    else:
+        st.info("최대 턴 수(7턴)에 도달했습니다.")
+
+    st.divider()
+    st.caption(f"현재 {st.session_state.t2_turns} 턴 완료")
+
+    if st.button("분석 요청 →", use_container_width=True, type="primary"):
+        with st.spinner("채점 중... (앙상블 3회, 약 20~30초 소요)"):
+            scores = run_scoring(st.session_state.chat_t1, st.session_state.chat_t2)
+            st.session_state.scores    = scores
+            st.session_state.aiq_index = compute_aiq_index(scores["QLI"], scores["Recon"])
+        st.session_state.stage = 4
+        st.rerun()
 
 
 # ─────────────────────────────────────────────
-# TAB 1: 분석
+# 3단계: 결과 리포트
 # ─────────────────────────────────────────────
-with tab_analyze:
-    col1, col2 = st.columns([1, 1.2])
+def stage_4():
+    # v8.1 — 스텝바 제거, 보고서 헤더로 대체
+    scores    = st.session_state.scores
+    type1     = st.session_state.type1
+    type2     = st.session_state.type2
+    ts        = st.session_state.type_scores
+    aiq       = st.session_state.aiq_index
+    qli       = scores.get("QLI",   5.0)
+    mti       = scores.get("MTI",   5.0)
+    recon     = scores.get("Recon", 5.0)
+    has_cs    = scores.get("ClassS", False)
+    insight   = scores.get("insight_ko", "")
+    low_rel        = scores.get("low_reliability", False)
+    scoring_failed = scores.get("scoring_failed", False)
 
+    # ─── 저장 (시리얼 채번) — 헤더 표시보다 먼저 실행 ───
+    if not st.session_state.saved:
+        serial = save_result(
+            name=st.session_state.user_name,
+            birth=st.session_state.user_birth,
+            type1=type1, type2=type2,
+            type_scores=ts, qli=qli, recon=recon,
+            mti=mti, aiq=aiq, has_class_s=has_cs,
+            answers=st.session_state.answers,
+            log_t1=st.session_state.chat_t1,
+            log_t2=st.session_state.chat_t2,
+            scoring_failed=scoring_failed
+        )
+        if serial:
+            st.session_state.user_serial = serial
+            st.session_state.saved = True
+
+    # ─── 보고서 헤더 ───
+    name_display  = st.session_state.user_name or "anonymous"
+    birth_raw     = st.session_state.user_birth or ""
+    # 19950315 → 1995.03.15 표시
+    birth_display = f"{birth_raw[:4]}.{birth_raw[4:6]}.{birth_raw[6:]}" if len(birth_raw) == 8 else ""
+    serial_disp   = st.session_state.user_serial or "진단 중"
+    diag_time     = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
+
+    st.markdown(f'''
+    <div class="report-header">
+      <p class="report-title">AIQ Diagnostic Report</p>
+      <p class="report-name">AI 공생 지수 진단 결과</p>
+      <div class="report-meta">
+        <span><strong>응답자</strong>{name_display} ({birth_display})</span>
+        <span><strong>시리얼</strong>{serial_disp}</span>
+        <span><strong>진단일</strong>{diag_time}</span>
+        <span><strong>버전</strong>AIQ v0.6 · 파일럿</span>
+      </div>
+    </div>
+    ''', unsafe_allow_html=True)
+
+    # ─── AIQ 단일 지수 — 화면 주인공 ───
+    badge_class_s = '<span class="aiq-badge">✦ 문제재정의</span>' if has_cs else ''
+    st.markdown(f'''
+    <div class="aiq-hero">
+      <p class="aiq-label">AIQ</p>
+      <p class="aiq-value">{aiq}</p>
+      <div class="aiq-badge-row">
+        <span class="aiq-badge">{type1}</span>
+        {badge_class_s}
+      </div>
+    </div>
+    ''', unsafe_allow_html=True)
+
+    # ─── 유형 설명 ───
+    axis = TYPE_AXIS.get(type1, ("", ""))
+    st.markdown(f'<h2 class="section-title">{type1}</h2>', unsafe_allow_html=True)
+    st.markdown(f'<p class="axis-tag">{axis[0]} · {axis[1]} — 1순위</p>', unsafe_allow_html=True)
+    st.markdown(f'<p class="type-quote">{TYPE_DESC.get(type1, "")}</p>', unsafe_allow_html=True)
+    st.divider()
+
+    # ─── 4유형 좌표 ───
+    st.markdown('<p class="sub-section-title">유형 좌표</p>', unsafe_allow_html=True)
+    type_order = ["상상가형", "설계자형", "의존형", "실행형"]
+    labels_map = {"설계자": "설계자형", "상상가": "상상가형", "실행": "실행형", "의존": "의존형"}
+
+    html_coord = '<div class="coord-grid">'
+    for t in type_order:
+        raw_key = next((k for k, v in labels_map.items() if v == t), "")
+        score_val = ts.get(raw_key, 0)
+        is_first  = (t == type1)
+        is_second = (t == type2)
+        suffix    = " ✦" if is_first else ""
+        rank_note = " — 1순위" if is_first else (" — 2순위" if is_second else "")
+        cls       = "cc cc-hl" if is_first else "cc"
+        html_coord += (
+            f'<div class="{cls}">'
+            f'<span class="cc-name">{t}{suffix}</span>'
+            f'<span class="cc-tag">{score_val}점{rank_note}</span>'
+            f'</div>'
+        )
+    html_coord += '</div>'
+    st.markdown(html_coord, unsafe_allow_html=True)
+
+    if type2:
+        st.markdown(f'<p class="second-rank">2순위: {type2}</p>', unsafe_allow_html=True)
+
+    st.divider()
+
+    # ─── 측정 근거 (서브 지표, 작게) ───
+    st.markdown('<p class="sub-section-title">측정 근거</p>', unsafe_allow_html=True)
+    mti_display = f"{mti:.1f}" + (" ✦" if has_cs else "")
+    st.markdown(f'''
+    <div class="sub-metrics">
+      <div class="sm sm-divider">
+        <p class="sm-lbl">질문 설계 QLI</p>
+        <p class="sm-val">{qli:.1f}</p>
+      </div>
+      <div class="sm sm-divider">
+        <p class="sm-lbl">재구성력 Recon</p>
+        <p class="sm-val">{recon:.1f}</p>
+      </div>
+      <div class="sm">
+        <p class="sm-lbl">사고 전환 MTI</p>
+        <p class="sm-val">{mti_display}</p>
+      </div>
+    </div>
+    ''', unsafe_allow_html=True)
+
+    if scoring_failed:
+        st.error("⚠️ 채점에 실패했습니다. 표시된 점수는 기본값(5.0)이며 실제 측정 결과가 아닙니다. 운영자에게 문의해주세요.")
+    elif low_rel:
+        st.warning(f"⚠️ MTI 신뢰도 낮음 — 앙상블 편차 > {DIVERGENCE_THRESHOLD}. 참고용으로만 활용하세요.")
+
+    if insight:
+        st.markdown(f'<div class="interp">{insight}</div>', unsafe_allow_html=True)
+
+    st.divider()
+
+    # ─── 저장 확인 표시 (저장은 보고서 헤더 직전에 이미 수행됨) ───
+    if st.session_state.saved and st.session_state.user_serial:
+        st.caption(f"✅ 결과가 저장되었습니다.  ·  시리얼: {st.session_state.user_serial}")
+    elif not st.session_state.saved:
+        st.warning("저장 실패 — 결과가 Google Sheets에 기록되지 않았습니다. 운영자에게 알려주세요.")
+
+    if st.button("처음으로 돌아가기", use_container_width=False):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+
+
+# ─────────────────────────────────────────────
+# 진입 화면 (응답자 정보 + 동의)
+# ─────────────────────────────────────────────
+def validate_name(name: str) -> bool:
+    """이름: 2~20자, 한글/영문/공백"""
+    if not name or not name.strip():
+        return False
+    return bool(re.match(r"^[가-힣A-Za-z\s]{2,20}$", name.strip()))
+
+
+def validate_birth(birth: str) -> bool:
+    """생년월일: YYYYMMDD 8자리 숫자, 유효한 날짜, 1900~현재"""
+    if not birth or len(birth) != 8 or not birth.isdigit():
+        return False
+    try:
+        d = datetime.strptime(birth, "%Y%m%d")
+        return 1900 <= d.year <= datetime.now().year
+    except ValueError:
+        return False
+
+
+def stage_0():
+    st.markdown("## AIQ 파일럿 진단")
+    st.markdown("""
+AI와 나는 어떻게 함께 사고하는가를 측정합니다.
+
+- **20개 행동 문항**으로 AI 협업 사고 유형을 분류합니다
+- **시나리오 2개**로 질문 설계력·사고 전환 점수를 산출합니다
+- 소요 시간: 약 10분
+    """)
+    st.divider()
+
+    st.markdown("### 응답자 정보")
+    col1, col2 = st.columns([1, 1])
     with col1:
-        st.subheader("👤 학습자 정보")
-        user_id     = st.text_input("학습자 ID", max_chars=10, value="id")
-        log_input   = st.text_area("분석할 [Conversation Log] 입력", height=500)
-        analyze_btn = st.button(
-            f"🚀 분석 시작 ({ENSEMBLE_N}회 교차 검증)",
-            use_container_width=True
+        name = st.text_input(
+            "이름",
+            value=st.session_state.get("user_name", ""),
+            max_chars=20,
+            placeholder="예: 홍길동"
+        )
+    with col2:
+        birth = st.text_input(
+            "생년월일 (YYYYMMDD)",
+            value=st.session_state.get("user_birth", ""),
+            max_chars=8,
+            placeholder="예: 19950315"
         )
 
-    if analyze_btn and user_id and log_input:
-        with col2:
-            analysis_time    = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
-            scores_list:     list[list[float]] = []
-            errors:          list[str]         = []
-            last_insight_ko: str               = ""
-            last_insight_en: str               = ""
+    st.caption("※ 결과 보고와 향후 재진단 시 식별을 위해 사용됩니다.")
+    st.divider()
 
-            progress_bar = st.progress(0)
-            status_text  = st.empty()
+    # 동의
+    consent = st.checkbox(
+        "응답자 식별 및 향후 재진단 시 결과 추적을 위해 이름과 생년월일을 수집·이용하는 것에 동의합니다. "
+        "수집된 정보는 진단 결과 보고와 데이터 분석 외 용도로 사용되지 않으며, 요청 시 삭제할 수 있습니다.",
+        value=st.session_state.get("consent_given", False)
+    )
 
-            for i in range(ENSEMBLE_N):
-                status_text.text(f"분석 중... ({i+1}/{ENSEMBLE_N}회)")
-                try:
-                    response = client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a CRP (Cognitive Re-configuration Protocol) analysis system.\n"
-                                    "Score each indicator from 1 to 10 based on the rubric below.\n"
-                                    "Always use ONLY this format:\n\n"
-                                    "[DATA]\n"
-                                    "MTI: <1-10>\nREC: <1-10>\nRECON: <1-10>\nORC: <1-10>\n"
-                                    "[INSIGHT_KO]\n"
-                                    "<학습자의 인지 행동을 관찰하여 해설하라. "
-                                    "로그의 내용이 아닌 학습자가 어떻게 사고했는지를 중심으로 써라.>\n"
-                                    "[INSIGHT_EN]\n"
-                                    "<Same insight in English only. "
-                                    "Focus on how the learner thought, not what the log contains.>\n\n"
+    st.markdown("")
 
-                                    "--- SCORING RUBRIC ---\n\n"
+    # 검증
+    name_valid    = validate_name(name)
+    birth_valid   = validate_birth(birth)
+    ready         = name_valid and birth_valid and consent
 
-                                    "MTI (Meta-cognitive Tension Index):\n"
-                                    "  Class hierarchy (Veenman 2011): A+ > A > B > C.\n"
-                                    "  Upper class structurally subsumes lower. Apply highest class only.\n\n"
-                                    "  1-3 [Class C or none]: No self-correction. "
-                                    "Accepts all AI outputs passively. "
-                                    "No negation or strategy revision detected.\n"
-                                    "  4-6 [Class B-C]: Occasionally revises approach or reflects. "
-                                    "Uses negation or revision phrases but transition takes many turns.\n"
-                                    "  7-9 [Class A]: Frequent self-negation "
-                                    "(e.g. 'I was wrong', 'I need to change this'). "
-                                    "Rapid perspective shifts within 1-2 turns after conflict. "
-                                    "Actively restructures logic with explicit reasoning.\n"
-                                    "  9-10 [Class A+]: Redefines the problem or task premise itself. "
-                                    "Challenges the frame of the question "
-                                    "(e.g. 'This question is wrongly posed', "
-                                    "'I need to redefine the problem'). "
-                                    "Why-layer thinking: questions the validity of the task itself, "
-                                    "not just the answer. Must cite exact learner utterance.\n\n"
+    # 검증 안내
+    if name and not name_valid:
+        st.warning("이름은 2~20자의 한글/영문으로 입력해주세요.")
+    if birth and not birth_valid:
+        st.warning("생년월일은 YYYYMMDD 8자리 형식이어야 합니다. (예: 19950315)")
 
-                                    "REC (Recognition):\n"
-                                    "  1-3: Simple keyword repetition. Cannot distinguish core concepts "
-                                    "from peripheral details. No relational understanding.\n"
-                                    "  4-6: Identifies some connections between concepts. "
-                                    "Partial pattern recognition. Begins to separate important from "
-                                    "less important information but inconsistently.\n"
-                                    "  7-10: Articulates structural relationships clearly. "
-                                    "Accurately classifies information by importance. "
-                                    "Extracts core principles and maps concept interdependencies independently.\n\n"
+    if st.button("진단 시작 →", use_container_width=True, type="primary", disabled=not ready):
+        st.session_state.user_name     = name.strip()
+        st.session_state.user_birth    = birth.strip()
+        st.session_state.consent_given = True
+        st.session_state.stage = 1
+        st.rerun()
 
-                                    "RECON (Reconfiguration):\n"
-                                    "  1-3: Accepts AI output as-is. No restructuring or alternative proposals. "
-                                    "Final output is structurally identical to initial framing.\n"
-                                    "  4-6: Partially modifies AI suggestions. Some novel connections attempted. "
-                                    "Moderate structural difference between initial and final design.\n"
-                                    "  7-10: Independently redesigns solutions beyond AI input (Piaget Accommodation). "
-                                    "Creates new conceptual structures. Final output shows clear structural "
-                                    "transformation from initial framing. Original alternatives proposed.\n\n"
-
-                                    "ORC (Orchestration):\n"
-                                    "  1-3: Vague, unstructured prompts. No task decomposition. "
-                                    "Passive AI use with no verification. Poor timing of resource allocation.\n"
-                                    "  4-6: Some structure in prompts with partial conditions. "
-                                    "Partial task sequencing. Occasionally reviews AI outputs. "
-                                    "Resource allocation timing is inconsistent.\n"
-                                    "  7-10: Precise, conditional prompts with clear constraints. "
-                                    "Systematic task decomposition and sequencing. "
-                                    "Actively verifies and redirects AI outputs at appropriate timing. "
-                                    "Stable orchestration across sessions signals consolidated baseline capability.\n"
-                                )
-                            },
-                            {"role": "user", "content": f"ID: {user_id}\nLog:\n{log_input}"}
-                        ],
-                        temperature=0.1
-                    )
-                    scores, insight_ko, insight_en = parse_response(
-                        response.choices[0].message.content
-                    )
-                    scores_list.append(scores)
-                    last_insight_ko = insight_ko
-                    last_insight_en = insight_en
-
-                except ValueError as ve:
-                    errors.append(f"회차 {i+1} 파싱 오류: {ve}")
-                except Exception as e:
-                    errors.append(f"회차 {i+1} API 오류: {e}")
-
-                progress_bar.progress(int((i + 1) / ENSEMBLE_N * 100))
-
-            status_text.empty()
-
-            if errors:
-                with st.expander(f"⚠️ 오류 {len(errors)}건"):
-                    for err in errors:
-                        st.warning(err)
-
-            if scores_list:
-                df  = pd.DataFrame(scores_list, columns=["MTI","Rec","Recon","Orc"])
-                avg = df.mean()
-                std = df.std() if len(scores_list) > 1 else None
-
-                st.success(f"✅ {len(scores_list)}/{ENSEMBLE_N}회 분석 완료")
-
-                if std is not None:
-                    st.caption(
-                        "📊 앙상블 표준편차 — "
-                        + " | ".join(f"{c}: ±{std[c]:.2f}" for c in ["MTI","Rec","Recon","Orc"])
-                    )
-
-                diag = diagnose_layer_divergence(scores_list)
-                if diag:
-                    if diag["flag"]:
-                        st.warning(
-                            f"⚠️ **MTI 레이어 불일치 감지** | "
-                            f"편차: {diag['divergence']:.2f} (τ_d={DIVERGENCE_THRESHOLD})\n\n"
-                            f"**유형:** {diag['type']}\n\n"
-                            f"**진단:** {diag['message']}"
-                        )
-                    else:
-                        st.success(
-                            f"✅ MTI 레이어 편차 정상 ({diag['divergence']:.2f} ≤ {DIVERGENCE_THRESHOLD})"
-                        )
-
-                fig, ax = plt.subplots(figsize=(6, 4))
-                ax.bar(
-                    ["MTI","Rec","Recon","Orc"],
-                    [avg["MTI"], avg["Rec"], avg["Recon"], avg["Orc"]],
-                    color=["#9b59b6","#3498db","#e74c3c","#2ecc71"],
-                    yerr=[std["MTI"], std["Rec"], std["Recon"], std["Orc"]] if std is not None else None,
-                    capsize=5
-                )
-                ax.set_ylim(0, 10)
-                ax.set_title("Ensemble Average (with std)")
-                img_buf = io.BytesIO()
-                plt.savefig(img_buf, format="png", bbox_inches="tight")
-                plt.close(fig)
-                img_buf.seek(0)
-                st.image(img_buf)
-
-                st.markdown("### 📌 나의 인지 상태")
-                cols = st.columns(4)
-                for col, key in zip(cols, ["MTI","Rec","Recon","Orc"]):
-                    label   = INDICATOR_GUIDE[key][0]
-                    score   = avg[key]
-                    comment = get_indicator_comment(key, score)
-                    with col:
-                        st.metric(label=f"{label} ({key})", value=f"{score:.2f}")
-                        st.caption(comment)
-
-                st.markdown("### 💡 종합 해설")
-                st.write(last_insight_ko)
-
-                save_timeseries(user_id, avg, last_insight_ko)
-                st.info(f"💾 {user_id}님의 데이터가 시계열 저장소에 기록되었습니다.")
-
-                pdf_data = create_ensemble_pdf(
-                    last_insight_en, user_id, analysis_time, avg
-                )
-                if pdf_data:
-                    st.download_button(
-                        label="📄 PDF 요약 다운로드",
-                        data=pdf_data,
-                        file_name=f"CRP_{user_id}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-            else:
-                st.error("❌ 모든 회차 분석 실패. 로그 형식 또는 API 상태를 확인하세요.")
+    if not consent:
+        st.caption("진단을 시작하려면 위 동의에 체크해주세요.")
 
 
 # ─────────────────────────────────────────────
-# TAB 2: 변곡점 정밀 분석 + 히스토리 테이블 + CSV
+# 라우터
 # ─────────────────────────────────────────────
-with tab_inflection:
-    st.subheader("🔍 Cognitive Inflection Point Analysis")
-    inflect_id  = st.text_input("분석할 학습자 ID", value="sj", key="inflect_id")
-    inflect_btn = st.button("🔍 변곡점 분석 조회", key="inflect_btn", use_container_width=True)
+stage = st.session_state.get("stage", 0)
 
-    if inflect_btn and inflect_id:
-        data = load_timeseries(inflect_id)
-
-        if data is None or data.empty:
-            st.info("No data found. Please run analysis first.")
-
-        elif len(data) < 2:
-            st.info(f"Minimum 2 sessions required. (Current: {len(data)})")
-
-        else:
-            core_metrics = ["MTI", "Rec", "Recon", "Orc"]
-            colors       = ["#9b59b6", "#3498db", "#e74c3c", "#2ecc71"]
-
-            # ── 4지표 시계열 그래프 ──
-            fig3, ax3 = plt.subplots(figsize=(11, 5))
-            for metric, color in zip(core_metrics, colors):
-                ax3.plot(data["timestamp"], data[metric],
-                         marker="o", label=metric, color=color, alpha=0.6, linewidth=1.5)
-
-            data["momentum"]     = data[core_metrics].mean(axis=1)
-            data["velocity"]     = data["momentum"].diff()
-            data["acceleration"] = data["velocity"].diff()
-
-            v_std       = data["velocity"].std()
-            # 최소 임계값 1.0 하한선 — 세션 수 적거나 점수 밀집 시 과탐지 방지
-            threshold   = max(v_std * 1.2 if v_std > 0 else 0.5, 1.0)
-            # 최소 5세션 미만이면 변곡점 탐지 보류
-            if len(data) < 5:
-                st.info(
-                    f"📊 현재 {len(data)}회 세션 — 변곡점 탐지는 5회 이상 누적 후 신뢰도가 높아집니다. "
-                    "데이터를 계속 축적하세요."
-                )
-                inflections = data.iloc[0:0]  # 빈 DataFrame
-            else:
-                inflections = data[data["velocity"].abs() > threshold]
-
-            for _, row in inflections.iterrows():
-                if row["velocity"] > 0:
-                    label_txt, line_color = "JUMP",  "#2ecc71"
-                else:
-                    label_txt, line_color = "PIVOT", "#95a5a6"
-                ax3.axvline(x=row["timestamp"], color=line_color, linestyle="--", alpha=0.4)
-                ax3.text(row["timestamp"], 10.3, label_txt,
-                         ha="center", fontsize=8, fontweight="bold", color=line_color)
-
-            ax3.set_ylim(0, 11)
-            ax3.set_ylabel("Cognitive Score")
-            ax3.set_title(f"Cognitive Trajectory: {inflect_id}", fontsize=12, pad=20)
-            ax3.legend(loc="upper left", bbox_to_anchor=(1, 1), frameon=False)
-            ax3.grid(axis="y", linestyle=":", alpha=0.3)
-            ax3.tick_params(axis="x", rotation=30)
-            plt.tight_layout()
-            st.pyplot(fig3)
-            plt.close(fig3)
-
-            # ── Cognitive Momentum ──
-            st.markdown("#### 📊 Cognitive Momentum")
-            fig4, ax4 = plt.subplots(figsize=(11, 2.5))
-            ax4.fill_between(data["timestamp"], data["momentum"], alpha=0.3, color="#3498db")
-            ax4.plot(data["timestamp"], data["momentum"], color="#3498db", linewidth=2)
-            ax4.set_ylim(0, 10)
-            ax4.tick_params(axis="x", rotation=30)
-            plt.tight_layout()
-            st.pyplot(fig4)
-            plt.close(fig4)
-
-            # ── 변곡점 상세 — 최근 2개만 표시 ──
-            st.markdown("#### 🚩 Analysis Details")
-            if not inflections.empty:
-                # 차트에는 전체 변곡점 표시, 상세 분석은 최근 2개만
-                inflections_display = inflections.tail(2)
-                if len(inflections) > 2:
-                    st.caption(
-                        f"전체 {len(inflections)}개 변곡점 중 최근 2개만 표시됩니다."
-                    )
-                for _, row in inflections_display.iterrows():
-                    tag = "Growth" if row["velocity"] > 0 else "Adjustment"
-                    with st.expander(
-                        f"[{tag}] {row['timestamp'].strftime('%m/%d %H:%M')} "
-                        f"| Velocity: {row['velocity']:+.2f}"
-                    ):
-                        col_a, col_b = st.columns([1, 4])
-                        col_a.metric("Velocity",     f"{row['velocity']:+.2f}")
-                        col_a.metric("Acceleration",
-                                     f"{row['acceleration']:+.2f}"
-                                     if pd.notna(row["acceleration"]) else "N/A")
-                        col_b.write(f"**Insight Summary:** {row['insight_summary']}")
-
-                    with st.spinner("AI 심층 분석 중..."):
-                        try:
-                            # ── [v6.3] delta 사전 계산 ──────────────────────
-                            diff = compute_pivot_differential(data, row)
-                            is_pivot = row["velocity"] < 0  # PIVOT=낙폭분석 / JUMP=상승분석
-
-                            # PIVOT: 낙폭 순위 라벨 / JUMP: 상승폭 순위 라벨
-                            if is_pivot:
-                                extreme_label = {1: "(↓최대)", 4: "(↓최소)"}
-                                extreme_metric_label = ("낙폭 최대", "낙폭 최소")
-                                direction_word = "낙폭"
-                                mti_stable_label = (
-                                    "YES — MTI 낙폭이 평균보다 작음 (trait 안정)"
-                                    if diff["mti_trait_stable"]
-                                    else "NO — MTI도 평균 이상 하락"
-                                )
-                            else:
-                                extreme_label = {4: "(↑최대)", 1: "(↑최소)"}
-                                extreme_metric_label = ("상승폭 최대", "상승폭 최소")
-                                direction_word = "변화폭"
-                                mti_stable_label = (
-                                    "YES — MTI 상승폭이 평균 이상"
-                                    if not diff["mti_trait_stable"]
-                                    else "YES — MTI 상승폭이 평균보다 작음"
-                                )
-
-                            delta_str = "  ".join(
-                                f"{m}: {diff['deltas'][m]:+.2f}"
-                                + extreme_label.get(diff["delta_ranks"][m], "")
-                                for m in ["MTI", "Rec", "Recon", "Orc"]
-                            )
-                            baseline_str = "  ".join(
-                                f"{m}: {diff['baseline'][m]:.2f}"
-                                for m in ["MTI", "Rec", "Recon", "Orc"]
-                            )
-                            current_str = "  ".join(
-                                f"{m}: {diff['current'][m]:.2f}"
-                                for m in ["MTI", "Rec", "Recon", "Orc"]
-                            )
-
-                            # ── [v6.4] 지표 의미 레이블 매핑 ─────────────
-                            METRIC_LABELS = {
-                                "MTI":   "스스로 틀렸음을 인식하고 사고를 전환하는 능력",
-                                "Rec":   "새로운 맥락에서 개념을 재인식하는 능력",
-                                "Recon": "개념들을 새 구조로 재조립하는 능력",
-                                "Orc":   "사고 흐름을 전략적으로 조율하는 능력",
-                            }
-
-                            max_m = diff["max_drop_metric"]
-                            min_m = diff["min_drop_metric"]
-
-                            # ── [v6.4] 시스템 프롬프트 — 궤적 언어 6개 규칙 ─
-                            system_prompt = (
-                                "당신은 CRP(Cognitive Re-configuration Protocol) "
-                                "인지 궤적 분석기입니다. "
-                                "다음 규칙을 반드시 지키십시오.\n\n"
-
-                                "규칙 1 — 궤적 서술: "
-                                "출력은 현재 상태 판정이 아닌 변화 과정 서술이어야 합니다.\n"
-                                "  ✗ '재조립 능력이 저하된 상태입니다'\n"
-                                "  ✓ '재조립 능력이 가장 빠르게 하락하며 다른 능력과 격차가 벌어졌습니다'\n\n"
-
-                                "규칙 2 — 비대칭 분석: "
-                                "지표별 변화폭 차이가 분석 핵심입니다. "
-                                "'모든 능력이 동일하게 변화했다'는 서술은 분석이 아닙니다.\n\n"
-
-                                "규칙 3 — 사고 전환 능력의 안정성: "
-                                "Veenman(2006)/Sweller(1988)에 따라 인지 부하·피로는 "
-                                "실행 수준 능력(재인식·재조립·조율)을 먼저 떨어뜨리고, "
-                                "메타 수준인 '스스로 틀렸음을 인식하는 능력'은 상대적으로 유지됩니다. "
-                                "이 패턴이 데이터에 나타나면 명시적으로 서술하십시오.\n\n"
-
-                                "규칙 4 — 분류 필수: "
-                                "확산집중형 / 균형성장형 / 실행편중형 / 인지포화형 "
-                                "중 하나를 반드시 출력하십시오.\n\n"
-
-                                "규칙 5 — 지표 약어 금지: "
-                                "MTI, Rec, Recon, Orc를 출력에 직접 쓰지 마십시오. "
-                                "각 능력의 의미를 동사·명사로 풀어 쓰십시오.\n\n"
-
-                                "규칙 6 — 헤징 금지: "
-                                "'가능성이 있습니다' 형태의 미확정 서술을 사용하지 마십시오.\n\n"
-
-                                "규칙 7 — 창작 금지: "
-                                "수치에 없는 내용을 추가하지 마십시오. "
-                                "금지 표현 예시: '~을 촉진했습니다', '조화롭게 발전', '~해야 합니다', '~하는 것이 좋습니다'. "
-                                "출력은 오직 제공된 delta·분류 힌트·수치에서 읽히는 사실만으로 구성하십시오."
-                            )
-
-                            # ── [v6.4] JUMP/PIVOT 방향에 맞게 주요 지표 선택 ─
-                            # PIVOT: 가장 많이 떨어진(sorted[0]) vs 가장 덜 떨어진(sorted[-1])
-                            # JUMP:  가장 많이 오른(sorted[-1]) vs 가장 덜 오른(sorted[0])
-                            if is_pivot:
-                                primary_m   = max_m   # sorted_by_drop[0] = 최대 낙폭
-                                secondary_m = min_m   # sorted_by_drop[-1] = 최소 낙폭
-                                primary_verb   = "가장 빠르게 하락"
-                                secondary_verb = "상대적으로 덜 하락"
-                                step2_label = "무엇이 버텼고 무엇이 먼저 꺾였는가"
-                                step2_mti_desc = (
-                                    f"인지 부하 상황에서도 "
-                                    f"{'평균보다 덜 하락하며 안정성을 유지했습니다' if diff['mti_trait_stable'] else '평균 이상으로 하락했습니다'}."
-                                )
-                            else:
-                                primary_m   = min_m   # sorted_by_drop[-1] = 최대 상승폭
-                                secondary_m = max_m   # sorted_by_drop[0]  = 최소 상승폭
-                                primary_verb   = "가장 크게 상승"
-                                secondary_verb = "상대적으로 덜 상승"
-                                step2_label = "무엇이 함께 올랐고 무엇이 덜 반응했는가"
-                                step2_mti_desc = (
-                                    f"다른 능력들이 상승하는 동안 "
-                                    f"{'평균 이상으로 함께 상승했습니다' if diff['mti_trait_stable'] else '평균보다 덜 상승하며 상대적으로 낮은 반응을 보였습니다'}."
-                                )
-
-                            # ── [v6.7] 유저 프롬프트 — 관찰 사실만, 창작 차단 ──
-                            prompt = (
-                                f"[CRP 인지 궤적 분석 — {inflect_id} / 세션 {row.name+1} / {tag}]\n\n"
-                                f"기준점(직전): {baseline_str}\n"
-                                f"현재값:       {current_str}\n"
-                                f"변화량(delta): {delta_str}\n"
-                                f"평균 변화량:  {diff['avg_delta']:+.2f}\n"
-                                f"사고 전환 능력 변화: {mti_stable_label}\n"
-                                f"사전 분류 힌트: {diff['class_hint']}\n\n"
-
-                                f"다음 4문장만 순서대로 작성하십시오. "
-                                f"각 문장은 위 수치에서 직접 읽히는 사실만 서술합니다. "
-                                f"수치에 없는 인과관계·가치 판단·권고를 추가하지 마십시오.\n\n"
-
-                                f"문장 1: '{METRIC_LABELS[primary_m]}'이(가) {diff['deltas'][primary_m]:+.2f}로 "
-                                f"{primary_verb}했고, '{METRIC_LABELS[secondary_m]}'은(는) "
-                                f"{diff['deltas'][secondary_m]:+.2f}로 {secondary_verb}했습니다. "
-                                f"이 두 수치의 차이({abs(diff['deltas'][primary_m]-diff['deltas'][secondary_m]):.2f})가 무엇을 나타내는지 서술하십시오.\n\n"
-
-                                f"문장 2: '스스로 틀렸음을 인식하고 사고를 전환하는 능력'({diff['deltas']['MTI']:+.2f})이 "
-                                f"{step2_mti_desc} 이 수치적 사실을 한 문장으로 서술하십시오.\n\n"
-
-                                f"문장 3: 위 수치 패턴을 근거로 분류({diff['class_hint']})를 확정하고 "
-                                f"그 근거를 한 문장으로 서술하십시오.\n\n"
-
-                                f"문장 4: 이 변화 흐름에서 관찰되는 사실 하나를 추가로 서술하십시오. "
-                                f"판단·권고·예측은 쓰지 마십시오.\n\n"
-
-                                f"총 4문장. 문장 번호 없이 연결해서 출력하십시오."
-                            )
-
-                            res = client.chat.completions.create(
-                                model="gpt-4o",
-                                messages=[
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user",   "content": prompt}
-                                ],
-                                temperature=0.1,   # 0.3 → 0.1
-                                max_tokens=300     # 500 → 300
-                            )
-                            st.markdown(
-                                f"**🧠 AI 심층 분석**\n\n"
-                                f"{res.choices[0].message.content.strip()}"
-                            )
-                            st.divider()
-                        except Exception as e:
-                            st.warning(f"분석 오류: {e}")
-            else:
-                st.info("No significant inflection points detected in current interval.")
-
-            # ── 히스토리 테이블 + CSV (Tab2에서 이전) ──
-            st.markdown("#### 🗂️ 분석 히스토리")
-            st.caption(
-                f"총 {len(data)}회 분석 기록 | "
-                f"{data['timestamp'].min().date()} ~ {data['timestamp'].max().date()}"
-            )
-            display_cols = ["timestamp","MTI","Rec","Recon","Orc","insight_summary"]
-            st.dataframe(
-                data[display_cols].rename(columns={
-                    "timestamp": "분석 일시", "insight_summary": "해설 요약"
-                }),
-                use_container_width=True
-            )
-            csv_bytes = data.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button(
-                label="⬇️ 시계열 데이터 CSV 다운로드",
-                data=csv_bytes,
-                file_name=f"CRP_history_{inflect_id}.csv",
-                mime="text/csv"
-            )
+if stage == 0:
+    stage_0()
+elif stage == 1:
+    stage_1()
+elif stage == 2:
+    stage_2()
+elif stage == 3:
+    stage_3()
+elif stage == 4:
+    stage_4()

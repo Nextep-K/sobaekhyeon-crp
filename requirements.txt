@@ -1,8 +1,5 @@
 streamlit
 openai
-pandas
+pytz
 gspread
 google-auth
-fpdf
-matplotlib
-pytz
