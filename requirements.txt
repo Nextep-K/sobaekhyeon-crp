@@ -3,3 +3,4 @@ openai
 pytz
 gspread==6.1.2
 google-auth
+requests
