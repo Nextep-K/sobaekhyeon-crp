@@ -379,8 +379,8 @@ st.markdown("""
                  border-radius:12px; margin:0 0 1.5rem; border:1px solid #DBEAFE; }
     .aiq-label { font-size:13px; font-weight:500; color:#6B7280;
                  letter-spacing:.08em; text-transform:uppercase; margin:0 0 .5rem; }
-    .aiq-value { font-size:72px; font-weight:700; color:#1D6FA8;
-                 line-height:1; margin:0; letter-spacing:-2px; }
+    .aiq-value { font-size:144px; font-weight:700; color:#1D6FA8;
+                 line-height:1; margin:0; letter-spacing:-4px; }
     .aiq-badge-row { margin-top:.75rem; display:flex; justify-content:center;
                      gap:8px; flex-wrap:wrap; }
     .aiq-badge { font-size:11px; font-weight:500; color:#1D6FA8;
