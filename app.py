@@ -72,9 +72,77 @@ TYPE_AXIS = {
 
 TYPE_DESC = {
     "설계자형": "AI를 도구로 부리는 사람. 질문 전에 목적을 정의하고, 결과를 받으면 재조립한다.",
-    "상상가형": "질문 수준은 높지만 결과를 재구성하는 데 어려움이 있다. 아이디어가 풍부하고 실행이 약하다.",
-    "실행형":   "AI 지시를 빠르게 실행하는 패턴이 우세하다. 구조보다 속도를 선택하는 경향이 있다.",
-    "의존형":   "AI 출력에 의존도가 높다. 자기 검증이 낮으며 사고 역량 강화가 필요하다.",
+    "상상가형": "AI와의 대화가 지적 유희인 사람. 질문의 수준은 높고 탐색의 폭은 넓지만, 그 풍요로운 대화가 결과물로 착지하지 못한다.",
+    "실행형":   "일단 받고, 고치면서 나아가는 사람. 빠르고 실용적이지만, 더 좋은 질문이 더 좋은 결과를 만든다는 사실을 가끔 잊는다.",
+    "의존형":   "AI가 주면 받는 사람. AI와 공생하는 게 아니라 AI에 기대고 있는 상태. AI를 깊이 신뢰하지만, 그 신뢰가 무비판적 수용으로 이어진다.",
+}
+
+# 4유형 × 4수준 코멘트 + 권고 (VF1 확정본)
+# 수준 기준: 17~20=뚜렷 / 13~16=보통 / 9~12=복합 / 5~8=미형성
+TYPE_COMMENTS = {
+    "설계자형": {
+        "뚜렷":  ("AI가 당신을 살짝 두려워할 것 같습니다. 질문하기 전에 이미 답의 윤곽이 머릿속에 있고, AI는 그것을 완성하는 도구에 가깝습니다. 이 관계에서 갑은 당신입니다.",
+                  "한 AI에게 초안을, 다른 AI에게 반론을 맡겨보세요. 설계자의 다음 단계는 AI를 병렬로 운용하는 것입니다."),
+        "보통":  ("제법 잘 다루고 있습니다. 가끔 AI 답을 그냥 쓰는 순간도 있지만 대체로 당신이 설계하고 AI가 실행합니다. 방향은 맞습니다.",
+                  "AI 결과를 받은 후 '이걸 반박해봐'를 한 번 더 시도해보세요. 재구성의 깊이가 달라집니다."),
+        "복합":  ("설계자의 DNA는 있습니다. 다만 AI 앞에서 가끔 주도권을 내어주는 경향이 있습니다. 30초가 성향을 바꿉니다.",
+                  "질문을 보내기 전 딱 한 줄 — '내가 원하는 최종 형태'를 먼저 적어보세요. 그 한 줄이 설계의 시작입니다."),
+        "미형성": ("설계자형과는 아직 거리가 있습니다. 괜찮습니다 — 모든 건축가도 처음엔 벽돌부터 배웠습니다.",
+                   "AI에게 '내 질문이 좋은 질문인지 평가해줘'라고 물어보세요. 자기 질문을 의심하는 순간이 설계자의 출발점입니다."),
+    },
+    "상상가형": {
+        "뚜렷":  ("대화창은 역대급으로 흥미롭고 역대급으로 미완성일 것입니다. 질문은 훌륭합니다 — 문제는 그 훌륭한 질문들이 결론 없이 탭을 닫히고 있다는 것입니다.",
+                  "대화를 시작할 때 첫 줄에 '이 대화의 결과물은 ___이다'를 적어놓고 시작해보세요. 탐색이 착지로 바뀝니다."),
+        "보통":  ("아이디어 생산력은 충분합니다. AI와 나눈 대화 중 절반만 결과물로 만들어도 꽤 생산적인 사람이 됩니다. 지금은 그 절반을 대화 안에 두고 있습니다.",
+                  "오늘 AI와 나눈 대화 중 가장 좋은 아이디어 하나를 골라 50자로 요약해보세요. 요약이 되면 결과물이 됩니다."),
+        "복합":  ("복잡한 질문을 즐기는 기질이 보입니다. 아직 그 즐거움이 실제 재구성으로 연결되지 않는 경우가 있습니다.",
+                  "AI 대화창을 닫기 전에 '내가 오늘 얻은 것 한 가지'를 적는 습관을 만들어보세요. 한 줄이면 충분합니다."),
+        "미형성": ("상상가형과는 거리가 있지만 발전 여지가 큽니다. 질문의 폭을 조금만 넓히면 AI가 생각보다 훨씬 흥미로운 상대임을 곧 발견하게 됩니다.",
+                   "AI에게 '엉뚱한 질문' 하나를 던져보세요. 정답을 찾는 게 아니라 대화를 즐기는 것이 상상가의 출발점입니다."),
+    },
+    "실행형": {
+        "뚜렷":  ("AI 시대의 장인입니다. 재료를 받으면 곧바로 손이 움직입니다. 입력보다 출력에 강한 유형 — 그 방식이 실제로 잘 작동하고 있습니다.",
+                  "같은 주제로 AI에게 '다른 방식의 답'을 한 번 더 요청해보세요. 비교가 질문 설계를 자연스럽게 가르칩니다."),
+        "보통":  ("AI 결과를 그냥 쓰지 않고 변환하는 감각이 있습니다. '더 좋은 질문을 했더라면 처음부터 덜 고쳤을 텐데' — 그 순간이 다음 단계의 입구입니다.",
+                  "AI 결과를 수정하기 전에 '왜 이 부분이 맞지 않는가'를 한 줄 적어보세요. 수정의 이유가 명확해지면 다음 질문이 달라집니다."),
+        "복합":  ("실행 성향이 있지만 AI 결과를 그대로 수용하는 경우도 혼재합니다. 변환 습관을 의식적으로 강화하면 실행형의 강점이 선명해집니다.",
+                  "AI 결과를 받은 후 한 문장만 내 언어로 바꿔써보세요. 그 한 문장이 재구성의 시작입니다."),
+        "미형성": ("아직 실행형과 거리가 있습니다. AI 결과를 내 상황에 맞게 바꿔보는 시도부터 시작해보세요.",
+                   "AI가 준 답변 중 '내 상황과 다른 부분' 하나를 찾아보세요. 차이를 발견하는 순간 실행형이 시작됩니다."),
+    },
+    "의존형": {
+        "뚜렷":  ("AI를 매우 신뢰하는 편입니다 — 어쩌면 지나치게. AI는 훌륭한 조수지만, 당신의 맥락은 당신만 압니다. AI가 모르는 것이 있습니다.",
+                  "AI가 준 답변에 '이건 내 상황과 다르다'고 반응하는 연습을 오늘 딱 한 번만 해보세요. 한 번이면 됩니다."),
+        "보통":  ("AI에 꽤 의존하는 편입니다. 당신만이 아는 맥락을 AI가 놓치고 있는 부분이 반드시 있습니다. 그 부분을 찾는 것이 시작입니다.",
+                  "AI 결과를 붙여넣기 전에 '이게 정말 내가 원하는 말인가'를 3초만 물어보세요. 딱 3초입니다."),
+        "복합":  ("의존 성향이 일부 있지만 다른 유형의 기질도 섞여 있습니다. 작은 습관 하나면 전환됩니다.",
+                  "AI에게 '이 답변의 한계가 뭐야'라고 한 번 물어보세요. AI 스스로 약점을 말해줍니다 — 그때부터 비판적 사용이 시작됩니다."),
+        "미형성": ("의존형 성향이 낮습니다. 이미 어딘가에서 AI를 비판적으로 쓰고 있는 것입니다. 2순위 유형을 확인해보세요.",
+                   "그 비판적 순간을 의식적으로 더 자주 만들어보세요. 이미 하고 있는 것을 더 하면 됩니다."),
+    },
+}
+
+def get_type_level(score: int) -> str:
+    """유형 점수(5~20) → 수준 반환"""
+    if score >= 17: return "뚜렷"
+    elif score >= 13: return "보통"
+    elif score >= 9:  return "복합"
+    else:             return "미형성"
+
+# 12개 조합 (1순위 × 2순위) — 캐릭터명 + 위트 한 줄
+TYPE_COMBOS = {
+    ("설계자형", "상상가형"): ("전략가",      "큰 그림을 그리고 새 프레임을 만든다"),
+    ("설계자형", "실행형"):   ("지휘관",      "설계하고 직접 전장에서 실행한다"),
+    ("설계자형", "의존형"):   ("기획가",      "설계는 내가, 실행은 맡긴다"),
+    ("상상가형", "설계자형"): ("탐험가",      "아이디어가 넘치고 가끔 착지도 한다"),
+    ("상상가형", "실행형"):   ("몽상 실행가",  "엉뚱한 아이디어를 일단 만들어본다"),
+    ("상상가형", "의존형"):   ("브레인스토머", "아이디어는 AI와 함께, 마무리는 내일"),
+    ("실행형",   "설계자형"): ("장인",        "만들면서 설계를 배운다"),
+    ("실행형",   "상상가형"): ("실험가",      "일단 만들고 엉뚱한 방향으로 튼다"),
+    ("실행형",   "의존형"):   ("스프린터",    "빠르게 받고 빠르게 쓴다"),
+    ("의존형",   "설계자형"): ("견습생",      "AI를 믿지만 설계 본능이 깨어나는 중"),
+    ("의존형",   "상상가형"): ("구경꾼",      "AI가 신기하고 재밌는데 아직 주도권이 없다"),
+    ("의존형",   "실행형"):   ("복사기",      "받아서 바로 쓰는데 나름 손은 빠르다"),
 }
 
 # ─────────────────────────────────────────────
@@ -227,7 +295,7 @@ st.markdown("""
                  border-radius:12px; margin:0 0 1.5rem; border:1px solid #DBEAFE; }
     .aiq-label { font-size:13px; font-weight:500; color:#6B7280;
                  letter-spacing:.08em; text-transform:uppercase; margin:0 0 .5rem; }
-    .aiq-value { font-size:96px; font-weight:700; color:#1D6FA8;
+    .aiq-value { font-size:72px; font-weight:700; color:#1D6FA8;
                  line-height:1; margin:0; letter-spacing:-2px; }
     .aiq-badge-row { margin-top:.75rem; display:flex; justify-content:center;
                      gap:8px; flex-wrap:wrap; }
@@ -622,21 +690,26 @@ def stage_4():
     </div>
     ''', unsafe_allow_html=True)
 
-    # AIQ 히어로
+    # AIQ 히어로 — 조합 캐릭터명 + 위트 한 줄
+    combo = TYPE_COMBOS.get((type1, type2), None)
+    combo_name = combo[0] if combo else type1.replace("형", "")
+    combo_desc = combo[1] if combo else TYPE_DESC.get(type1, "")
+
     st.markdown(f'''
     <div class="aiq-hero">
       <p class="aiq-label">AIQ</p>
       <p class="aiq-value">{aiq}</p>
       <div class="aiq-badge-row">
-        <span class="aiq-badge">{type1}</span>
+        <span class="aiq-badge">{combo_name}</span>
       </div>
+      <p style="margin:.6rem 0 0; font-size:13px; color:#6B7280;">"{combo_desc}"</p>
     </div>
     ''', unsafe_allow_html=True)
 
     # 유형 설명
     axis = TYPE_AXIS.get(type1, ("",""))
-    st.markdown(f'<h2 class="section-title">{type1}</h2>', unsafe_allow_html=True)
-    st.markdown(f'<p class="axis-tag">{axis[0]} · {axis[1]} — 1순위</p>', unsafe_allow_html=True)
+    st.markdown(f'<h2 class="section-title">{combo_name}</h2>', unsafe_allow_html=True)
+    st.markdown(f'<p class="axis-tag">{type1} · {axis[0]} {axis[1]} — 1순위 &nbsp;|&nbsp; {type2} — 2순위</p>', unsafe_allow_html=True)
     st.markdown(f'<p class="type-quote">{TYPE_DESC.get(type1,"")}</p>', unsafe_allow_html=True)
     st.divider()
 
@@ -657,14 +730,24 @@ def stage_4():
         st.markdown(f'<p class="second-rank">2순위: {type2}</p>', unsafe_allow_html=True)
     st.divider()
 
-    # 서브 지표
-    st.markdown('<p class="sub-section-title">측정 근거</p>', unsafe_allow_html=True)
-    st.markdown(f'''
-    <div class="sub-metrics">
-      <div class="sm"><p class="sm-lbl">질문 설계 QLI</p><p class="sm-val">{qli}</p></div>
-      <div class="sm"><p class="sm-lbl">사고 전환 MTI</p><p class="sm-val">{mti}</p></div>
-    </div>
-    ''', unsafe_allow_html=True)
+    # 유형 코멘트 + 권고 (VF1 확정본)
+    type1_score = st.session_state.type_scores.get(
+        next((k for k, v in TYPE_LABELS.items() if v == type1), ""), 0
+    )
+    level = get_type_level(type1_score)
+    if type1 in TYPE_COMMENTS and level in TYPE_COMMENTS[type1]:
+        comment, advice = TYPE_COMMENTS[type1][level]
+        st.markdown(f"""
+        <div style="background:#F9FAFB;border:1px solid #E5E7EB;border-radius:8px;
+                    padding:.9rem 1rem;margin-bottom:.75rem;font-size:13px;
+                    color:#374151;line-height:1.7;">
+            {comment}
+        </div>
+        <div style="background:#EBF4FF;border:1px solid #DBEAFE;border-radius:8px;
+                    padding:.75rem 1rem;font-size:13px;color:#1D6FA8;line-height:1.7;">
+            💡 {advice}
+        </div>
+        """, unsafe_allow_html=True)
     st.divider()
 
     # 저장 상태
