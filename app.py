@@ -1,22 +1,21 @@
 # =============================================================================
 # AIQ 파일럿 — Streamlit 앱
-# Version: v9.0  (2026.06)
+# Version: v9.1  (2026.06)
 #
-# 핵심 변경 (v8.x 전면 재설계):
-#   [연결]  v7.4 방식 완전 복원 — gspread.authorize(creds), @st.cache_resource 없음
-#           실제 작동이 증명된 유일한 방식
-#   [저장]  단일 시트(responses) — participants/responses 분리 폐기
-#           저장 내용 최소화 (LLM 채점 없음, 대화 로그 없음)
-#   [측정]  주관식 대화 완전 제거 → 서사형 객관식 2개 시나리오로 대체
-#           Q1(QLI) + Q1-followup, Q2-A + Q2-B + Q2-followup
-#           선택값 조합으로 점수 직접 산출 — LLM 채점 0회
-#   [UX]    API 호출: 대화 진행 0회, 채점 0회
-#           저장 실패 지점: 1개 (단일 append_row)
+# 변경 이력:
+#   v9.1 — 유형 보고서 텍스트를 GitHub MD 파일에서 동적 호출
+#          · load_content() — raw URL에서 MD 파일 로드, @st.cache_data(ttl=3600)
+#          · parse_content() — MD 파싱 → {(type1,type2): 섹션 dict}
+#          · 코드 재배포 없이 MD 파일만 수정하면 텍스트 즉시 반영
+#          · 호출 실패 시 코드 내 TYPE_COMBOS/TYPE_DESC fallback 유지
+#
+#   v9.0 — 서사형 객관식 구조 + v7.4 연결 방식 + 단일 시트 저장
 # =============================================================================
 
 import streamlit as st
 from openai import OpenAI
 import re
+import requests
 from datetime import datetime
 import pytz
 import gspread
@@ -198,6 +197,91 @@ def validate_birth(birth: str) -> bool:
         return 1900 <= d.year <= datetime.now().year
     except ValueError:
         return False
+
+# ─────────────────────────────────────────────
+# 유형 보고서 콘텐츠 — GitHub MD 동적 호출
+# ─────────────────────────────────────────────
+CONTENT_URL = (
+    "https://raw.githubusercontent.com/Nextep-K/sobaekhyeon-crp/main/aiq_content_v1.md"
+)
+
+@st.cache_data(ttl=3600)
+def load_content() -> dict:
+    """
+    GitHub raw URL에서 MD 파일을 로드하고 파싱하여 반환한다.
+    반환값: {(type1, type2): {"name","tagline","quote","quote_attr",
+                              "intro","strength","trap","perception","advice"}}
+    실패 시 빈 dict — 코드 내 TYPE_COMBOS/TYPE_DESC가 fallback으로 작동.
+    """
+    try:
+        r = requests.get(CONTENT_URL, timeout=5)
+        if r.status_code != 200:
+            return {}
+        return parse_content(r.text)
+    except Exception:
+        return {}
+
+
+def parse_content(md: str) -> dict:
+    """
+    MD 파일 텍스트 → {(type1, type2): sections_dict}
+
+    섹션 헤더 형식: ## 01. 지휘관 · 설계자형 + 실행형
+    섹션 블록 형식: **이런 사람입니다** (줄 시작)
+    """
+    result = {}
+    # 각 유형 블록을 ## 헤더로 분리
+    blocks = re.split(r"\n## \d+\.", md)
+    for block in blocks[1:]:  # 첫 번째는 파일 헤더
+        lines = block.strip().split("\n")
+        header = lines[0].strip()  # "지휘관 · 설계자형 + 실행형"
+
+        # 캐릭터명 + 유형 조합 파싱
+        m = re.match(r"(.+?)\s*·\s*(\S+형)\s*\+\s*(\S+형)", header)
+        if not m:
+            continue
+        char_name = m.group(1).strip()
+        type1     = m.group(2).strip()
+        type2     = m.group(3).strip()
+
+        body = "\n".join(lines[1:])
+
+        # 위트(tagline) — 첫 번째 > ** 블록
+        tagline_m = re.search(r'>\s*\*\*"(.+?)"\*\*', body)
+        tagline   = tagline_m.group(1) if tagline_m else ""
+
+        # 명언 — 두 번째 > * 블록
+        quote_m   = re.search(r'>\s*\*"(.+?)"\*', body)
+        quote     = quote_m.group(1) if quote_m else ""
+        # 명언 출처
+        quote_attr_m = re.search(r'—\s*(.+?)$', quote, re.M) if quote else None
+        if "—" in quote:
+            parts      = quote.split("—", 1)
+            quote      = parts[0].strip()
+            quote_attr = "— " + parts[1].strip()
+        else:
+            quote_attr = ""
+
+        def extract_section(label: str) -> str:
+            """**label** 이후 다음 ** 블록 전까지 텍스트 추출"""
+            pattern = rf"\*\*{re.escape(label)}\*\*\n(.*?)(?=\n\*\*|\Z)"
+            sm = re.search(pattern, body, re.S)
+            return sm.group(1).strip() if sm else ""
+
+        result[(type1, type2)] = {
+            "name":        char_name,
+            "tagline":     tagline,
+            "quote":       quote,
+            "quote_attr":  quote_attr,
+            "intro":       extract_section("이런 사람입니다"),
+            "strength":    extract_section("가장 빛나는 순간"),
+            "trap":        extract_section("이 유형의 함정"),
+            "perception":  extract_section("다른 사람 눈에 비치는 당신"),
+            "advice":      extract_section("지금 필요한 한 가지"),
+        }
+
+    return result
+
 
 # ─────────────────────────────────────────────
 # Google Sheets — v7.4 방식 완전 복원
@@ -690,10 +774,21 @@ def stage_4():
     </div>
     ''', unsafe_allow_html=True)
 
-    # AIQ 히어로 — 조합 캐릭터명 + 위트 한 줄
-    combo = TYPE_COMBOS.get((type1, type2), None)
-    combo_name = combo[0] if combo else type1.replace("형", "")
-    combo_desc = combo[1] if combo else TYPE_DESC.get(type1, "")
+    # MD 콘텐츠 로드 (캐시됨, 실패 시 빈 dict)
+    content = load_content()
+    combo_data = content.get((type1, type2), None)
+
+    # 캐릭터명 + 위트 — MD 우선, fallback은 TYPE_COMBOS
+    combo_fallback = TYPE_COMBOS.get((type1, type2), None)
+    if combo_data:
+        combo_name = combo_data["name"]
+        combo_desc = combo_data["tagline"]
+    elif combo_fallback:
+        combo_name = combo_fallback[0]
+        combo_desc = combo_fallback[1]
+    else:
+        combo_name = type1.replace("형", "")
+        combo_desc = TYPE_DESC.get(type1, "")
 
     st.markdown(f'''
     <div class="aiq-hero">
@@ -730,24 +825,79 @@ def stage_4():
         st.markdown(f'<p class="second-rank">2순위: {type2}</p>', unsafe_allow_html=True)
     st.divider()
 
-    # 유형 코멘트 + 권고 (VF1 확정본)
-    type1_score = st.session_state.type_scores.get(
-        next((k for k, v in TYPE_LABELS.items() if v == type1), ""), 0
-    )
-    level = get_type_level(type1_score)
-    if type1 in TYPE_COMMENTS and level in TYPE_COMMENTS[type1]:
-        comment, advice = TYPE_COMMENTS[type1][level]
-        st.markdown(f"""
-        <div style="background:#F9FAFB;border:1px solid #E5E7EB;border-radius:8px;
-                    padding:.9rem 1rem;margin-bottom:.75rem;font-size:13px;
-                    color:#374151;line-height:1.7;">
-            {comment}
-        </div>
-        <div style="background:#EBF4FF;border:1px solid #DBEAFE;border-radius:8px;
-                    padding:.75rem 1rem;font-size:13px;color:#1D6FA8;line-height:1.7;">
-            💡 {advice}
-        </div>
-        """, unsafe_allow_html=True)
+    if combo_data:
+        # ─── MD 콘텐츠 풀버전 ───
+        # 명언 블록
+        if combo_data.get("quote"):
+            st.markdown(f'''
+            <div style="background:var(--color-background-secondary);
+                        border-left:3px solid var(--color-border-info);
+                        border-radius:0;padding:.85rem 1rem;margin:0 0 1rem;">
+              <p style="font-size:14px;font-weight:500;color:var(--color-text-primary);
+                        margin:0 0 .25rem;line-height:1.5;">"{combo_data["quote"]}"</p>
+              <p style="font-size:12px;color:var(--color-text-secondary);
+                        margin:0;font-style:italic;">{combo_data.get("quote_attr","")}</p>
+            </div>
+            ''', unsafe_allow_html=True)
+
+        # 5개 섹션
+        sections = [
+            ("이런 사람입니다",        "intro"),
+            ("가장 빛나는 순간",       "strength"),
+            ("이 유형의 함정",         "trap"),
+            ("다른 사람 눈에 비치는 당신", "perception"),
+        ]
+        for title, key in sections:
+            text = combo_data.get(key, "")
+            if text:
+                st.markdown(f'''
+                <div style="margin:0 0 1rem;">
+                  <p style="font-size:13px;font-weight:500;
+                            color:var(--color-text-primary);margin:0 0 .3rem;">{title}</p>
+                  <p style="font-size:13px;color:var(--color-text-secondary);
+                            line-height:1.75;margin:0;">{text}</p>
+                </div>
+                ''', unsafe_allow_html=True)
+
+        # 지금 필요한 한 가지 — 파란 박스
+        advice = combo_data.get("advice", "")
+        if advice:
+            st.markdown(f'''
+            <div style="background:var(--color-background-info);
+                        border-radius:var(--border-radius-md);
+                        padding:.85rem 1rem;margin:0 0 1rem;">
+              <p style="font-size:11px;font-weight:500;color:var(--color-text-info);
+                        letter-spacing:.06em;text-transform:uppercase;margin:0 0 .3rem;">
+                💡 지금 필요한 한 가지</p>
+              <p style="font-size:13px;color:var(--color-text-info);
+                        line-height:1.7;margin:0;">{advice}</p>
+            </div>
+            ''', unsafe_allow_html=True)
+
+    else:
+        # ─── fallback: 기존 TYPE_COMMENTS 코멘트 박스 ───
+        type1_score = st.session_state.type_scores.get(
+            next((k for k, v in TYPE_LABELS.items() if v == type1), ""), 0
+        )
+        level = get_type_level(type1_score)
+        if type1 in TYPE_COMMENTS and level in TYPE_COMMENTS[type1]:
+            comment, advice = TYPE_COMMENTS[type1][level]
+            st.markdown(f'''
+            <div style="background:var(--color-background-secondary);
+                        border:0.5px solid var(--color-border-tertiary);
+                        border-radius:var(--border-radius-md);
+                        padding:.9rem 1rem;margin-bottom:.75rem;
+                        font-size:13px;color:var(--color-text-secondary);line-height:1.7;">
+                {comment}
+            </div>
+            <div style="background:var(--color-background-info);
+                        border-radius:var(--border-radius-md);
+                        padding:.75rem 1rem;font-size:13px;
+                        color:var(--color-text-info);line-height:1.7;">
+                💡 {advice}
+            </div>
+            ''', unsafe_allow_html=True)
+
     st.divider()
 
     # 저장 상태
