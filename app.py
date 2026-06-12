@@ -1,8 +1,34 @@
 # =============================================================================
 # AIQ 파일럿 — Streamlit 앱
-# Version: v9.1  (2026.06)
+# Version: v10.0 (2026.06) — 프로토타입 전면 개편
 #
 # 변경 이력:
+#   v10.0 — 측정 구조 재설계 (프로토타입)
+#          · 1단계: 12문항(유형별 순방향2+역방향1) — 유형 분류 전용, 점수 미산출
+#          · 2단계: 시나리오 객관식 폐지 → AI와 열린 대화 (최대 7턴, 조기 종료 가능)
+#          · 채점: 대화 종료 후 전체 로그 일괄 LLM 채점 (QLI 4지표 / MTI 3전환차원)
+#          · AIQ = 100 + (QLI + MTI − 10) × 5  [공식 유지]
+#          · 결과 화면: 점수 카드와 유형 카드 분리
+#          · 1단계 무변별 응답(전부 동일값) 플래그 표시
+#
+#   v9.4 — 관리자 인증을 이메일 OTP 방식으로 교체
+#          · ADMIN_EMAILS 허용 목록 + Gmail SMTP 6자리 코드 발송
+#          · 코드 유효 10분 / 시도 5회 제한 / 재발송 60초 쿨다운
+#          · OTP는 해시로만 세션에 보관 (hmac 상수시간 비교)
+#          · 필요 secrets: ADMIN_EMAILS, SMTP_USER, SMTP_PASSWORD
+#
+#   v9.3 — 앱 내 문항 관리자 화면 추가 (?mode=admin)
+#          · ADMIN_PASSWORD secret 인증 (v9.4에서 OTP로 대체)
+#          · 문항 추가 / 활성·비활성 토글 / 삭제 (2단계 확인)
+#          · 유형별 최소 5문항 제약 위반 시 비활성·삭제 차단
+#          · 변경 즉시 캐시 무효화 — 사용자 화면 실시간 반영
+#
+#   v9.2 — L1 문항 풀 Google Sheets 외부화
+#          · questions 탭에서 활성 문항 로드 (no/text/type/reverse/active)
+#          · 유형별 5문항 랜덤 추출 → 20문항 세션 고정
+#          · 탭 없으면 기존 20문항으로 자동 생성(bootstrap)
+#          · 시트 오류·제약 미달 시 코드 내 QUESTIONS_FALLBACK으로 폴백
+#
 #   v9.1 — 유형 보고서 텍스트를 GitHub MD 파일에서 동적 호출
 #          · load_content() — raw URL에서 MD 파일 로드, @st.cache_data(ttl=3600)
 #          · parse_content() — MD 파싱 → {(type1,type2): 섹션 dict}
@@ -20,6 +46,13 @@ from datetime import datetime
 import pytz
 import gspread
 from google.oauth2.service_account import Credentials
+import smtplib
+import ssl
+import time
+import hashlib
+import hmac
+import secrets as _pysecrets
+from email.mime.text import MIMEText
 
 # ─────────────────────────────────────────────
 # 설정
@@ -35,9 +68,9 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────
-# AIQ 20문항 정의 (VF1 확정본)
+# AIQ 20문항 정의 (VF1 확정본) — 시트 로드 실패 시 폴백
 # ─────────────────────────────────────────────
-QUESTIONS = [
+QUESTIONS_FALLBACK = [
     (1,  "AI에게 질문을 보내기 전에 내가 원하는 결과를 먼저 정의한다",        "설계자", False),
     (2,  "AI가 답을 주면 그 흐름에 맞춰 대화를 이어간다",                     "의존",   False),
     (3,  "AI가 새로운 시각을 제시해도 내 기존 생각을 쉽게 바꾸지 않는다",     "상상가", True),
@@ -147,22 +180,89 @@ TYPE_COMBOS = {
 # ─────────────────────────────────────────────
 # 점수 매트릭스 (선택값 → 점수)
 # ─────────────────────────────────────────────
-# Q1 + Q1-followup 조합 → QLI 점수 (1~10)
-QLI_MATRIX = {
-    ("1", "a"): 3, ("1", "b"): 4, ("1", "c"): 5, ("1", "d"): 2,
-    ("2", "a"): 5, ("2", "b"): 7, ("2", "c"): 9, ("2", "d"): 3,
-    ("3", "a"): 5, ("3", "b"): 9, ("3", "c"): 6, ("3", "d"): 4,
-    ("4", "a"): 6, ("4", "b"): 9, ("4", "c"): 7, ("4", "d"): 10,
-}
+# ─────────────────────────────────────────────
+# 2단계 — AI 열린 대화 설정 (v10.0)
+# ─────────────────────────────────────────────
+DIALOGUE_TOPIC = "AI 시대의 미래에 일어날 경제적 양극화 문제"
+MAX_USER_TURNS = 7   # 사용자 발화 상한
+MIN_TURNS_TO_FINISH = 2  # 종료 버튼 활성화 최소 사용자 발화 수
 
-# Q2-B + Q2-followup 조합 → MTI 점수 (1~10)
-# Q2-B=1(전환없음) / Q2-B=2,3,4(전환)
-MTI_MATRIX = {
-    ("1", "a"): 4, ("1", "b"): 5, ("1", "c"): 6, ("1", "d"): 2,
-    ("2", "a"): 6, ("2", "b"): 8, ("2", "c"): 10, ("2", "d"): 4,
-    ("3", "a"): 6, ("3", "b"): 8, ("3", "c"): 10, ("3", "d"): 4,
-    ("4", "a"): 6, ("4", "b"): 8, ("4", "c"): 10, ("4", "d"): 4,
-}
+DIALOGUE_SYSTEM_PROMPT = f"""당신은 '{DIALOGUE_TOPIC}'를 함께 논의하는 토론 파트너다.
+규칙:
+- 한국어로, 3~5문장으로 답한다.
+- 사용자의 질문에 충실히 답하되, 매 답변에 사용자가 미처 생각하지 못했을 관점이나 정보를 정확히 1개 포함한다.
+- 단정하지 말고 근거와 함께 관점을 제시한다.
+- 사용자에게 되묻지 않는다. 답변만 한다."""
+
+SCORING_PROMPT = """당신은 심리측정 전문가다. 아래는 한 사용자가 AI와 '{topic}'를 논의한 대화 전문이다.
+사용자의 발화만을 근거로 두 지표를 1~10 정수로 채점하라.
+
+[QLI — 질문 구성력] 사용자의 첫 질문(필요시 1~2번째 발화)을 다음 4개 지표로 평가해 종합:
+1. 목적 정향성: 무엇을 얻으려는지 명시했는가 (막연한 질문=低, 원하는 산출·관점 규정=高)
+2. 맥락 구조화: 시점·범위·대상·조건을 제공했는가
+3. 인지적 부하 설계: AI에게 비교·인과·시나리오 등 구조적 사고를 요구했는가 (단순 정보 요구=低)
+4. 주도성: 대화 방향을 사용자가 설계하는가, AI에 판단을 위임하는가
+
+[MTI — 메타인지 전환] 2번째 발화부터, AI 응답이 사용자의 사고를 움직였는가:
+- 프레임 전환: AI 답을 받아 질문의 전제·관점 자체를 재설정
+- 심화 전환: AI 답의 허점·전제를 파고들어 구체화
+- 통합 전환: 이전 답들을 엮어 새로운 질문 구성
+- 전환이 빠를수록(적은 턴), 깊을수록 높게. 같은 수준 반복·재진술만 있으면 1~3.
+- 사용자 발화가 1개뿐이면 MTI=3 (전환 기회 자체가 관측되지 않음).
+
+반드시 아래 JSON만 출력하라. 다른 텍스트 금지.
+{{"qli": <1-10 정수>, "mti": <1-10 정수>, "transition_turn": <전환이 처음 나타난 사용자 발화 번호, 없으면 0>, "comment": "<채점 근거 한두 문장, 행동 기반 언어>"}}
+
+[대화 전문]
+{transcript}
+"""
+
+
+def generate_ai_reply(dialogue: list) -> str:
+    """대화 이력 기반 AI 응답 생성. 실패 시 안내 문구."""
+    try:
+        msgs = [{"role": "system", "content": DIALOGUE_SYSTEM_PROMPT}]
+        msgs += [{"role": m["role"], "content": m["content"]} for m in dialogue]
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini", messages=msgs,
+            max_tokens=500, temperature=0.7,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return "(AI 응답 생성에 실패했습니다. 계속 질문을 이어가거나 논의를 마쳐주세요.)"
+
+
+def score_dialogue(dialogue: list) -> tuple:
+    """
+    대화 종료 후 일괄 채점. 반환: (qli, mti, transition_turn, comment)
+    실패 시 (5, 5, 0, "") — 중립값 폴백.
+    """
+    lines, uturn = [], 0
+    for m in dialogue:
+        if m["role"] == "user":
+            uturn += 1
+            lines.append(f"[사용자 발화 {uturn}] {m['content']}")
+        else:
+            lines.append(f"[AI 응답] {m['content']}")
+    transcript = "\n".join(lines)
+    prompt = SCORING_PROMPT.format(topic=DIALOGUE_TOPIC, transcript=transcript)
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300, temperature=0.0,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"```(json)?|```", "", raw).strip()
+        import json as _json
+        data = _json.loads(raw)
+        qli = max(1, min(10, int(data.get("qli", 5))))
+        mti = max(1, min(10, int(data.get("mti", 5))))
+        tt  = max(0, int(data.get("transition_turn", 0)))
+        cm  = str(data.get("comment", ""))[:300]
+        return qli, mti, tt, cm
+    except Exception:
+        return 5, 5, 0, ""
 
 def compute_aiq(qli: int, mti: int) -> int:
     """AIQ 지수 산출 — 100 기준, 범위 약 70~150"""
@@ -171,9 +271,9 @@ def compute_aiq(qli: int, mti: int) -> int:
 # ─────────────────────────────────────────────
 # 유형 산출
 # ─────────────────────────────────────────────
-def compute_type_scores(answers: dict) -> dict:
+def compute_type_scores(answers: dict, questions: list) -> dict:
     scores = {"설계자": 0, "상상가": 0, "실행": 0, "의존": 0}
-    for (no, text, typ, reverse) in QUESTIONS:
+    for (no, text, typ, reverse) in questions:
         val = answers.get(no, 2)
         if reverse:
             val = 5 - val
@@ -298,6 +398,267 @@ def get_gsheet_client():
     return gspread.authorize(creds)
 
 
+# ─────────────────────────────────────────────
+# L1 문항 풀 — Google Sheets 외부화 (v9.2)
+# 탭: questions  ·  열: no / text / type / reverse / active
+# ─────────────────────────────────────────────
+import random
+
+VALID_TYPES = ("설계자", "상상가", "실행", "의존")
+MIN_FWD_PER_TYPE = 2  # 유형별 순방향 최소 (v10.0: 출제 2문항)
+MIN_REV_PER_TYPE = 1  # 유형별 역방향 최소 (v10.0: 출제 1문항)
+# 세션 출제 = 유형별 (순방향 2 + 역방향 1) = 총 12문항. 유형 분류 전용, 점수 미산출.
+
+
+def _to_bool(v) -> bool:
+    """시트 셀 값을 bool로 정규화 (TRUE/1/y/yes 허용)"""
+    return str(v).strip().upper() in ("TRUE", "1", "Y", "YES")
+
+
+def _bootstrap_questions_sheet(ss) -> None:
+    """questions 탭이 없으면 폴백 20문항으로 생성한다."""
+    ws = ss.add_worksheet(title="questions", rows=200, cols=5)
+    ws.append_row(["no", "text", "type", "reverse", "active"])
+    rows = [[no, text, typ, str(rev).upper(), "TRUE"]
+            for (no, text, typ, rev) in QUESTIONS_FALLBACK]
+    ws.append_rows(rows)
+
+
+@st.cache_data(ttl=300)
+def load_question_pool() -> list | None:
+    """
+    questions 탭에서 활성 문항을 로드한다.
+    반환: [(no:int, text:str, type:str, reverse:bool), ...] 또는 실패 시 None
+    - 탭이 없으면 폴백 문항으로 자동 생성 후 그것을 반환
+    - no 중복 시 첫 번째만 유지
+    - 캐시 ttl=300 — 시트 수정 후 최대 5분 내 반영
+    """
+    try:
+        gc = get_gsheet_client()
+        ss = gc.open(SHEET_NAME)
+        try:
+            ws = ss.worksheet("questions")
+        except gspread.WorksheetNotFound:
+            _bootstrap_questions_sheet(ss)
+            ws = ss.worksheet("questions")
+
+        records = ws.get_all_records()
+        pool, seen = [], set()
+        for r in records:
+            if not _to_bool(r.get("active", "")):
+                continue
+            try:
+                no = int(r.get("no", 0))
+            except (TypeError, ValueError):
+                continue
+            text = str(r.get("text", "")).strip()
+            typ  = str(r.get("type", "")).strip()
+            if no <= 0 or no in seen or not text or typ not in VALID_TYPES:
+                continue
+            seen.add(no)
+            pool.append((no, text, typ, _to_bool(r.get("reverse", ""))))
+        return pool if pool else None
+    except Exception:
+        return None
+
+
+def validate_pool(pool: list) -> bool:
+    """유형별 순방향 ≥2, 역방향 ≥1 확보 여부 검증 (v10.0)"""
+    if not pool:
+        return False
+    fwd = {t: 0 for t in VALID_TYPES}
+    rev = {t: 0 for t in VALID_TYPES}
+    for (_, _, typ, reverse) in pool:
+        (rev if reverse else fwd)[typ] += 1
+    return all(fwd[t] >= MIN_FWD_PER_TYPE and rev[t] >= MIN_REV_PER_TYPE
+               for t in VALID_TYPES)
+
+
+def build_question_set() -> list:
+    """
+    문항 풀에서 유형별 순방향 2 + 역방향 1 랜덤 추출 → 셔플하여 12문항 반환.
+    풀 로드 실패 또는 제약 미달 시 QUESTIONS_FALLBACK 반환.
+    호출 측에서 session_state에 1회 저장하여 세션 내 고정해야 한다.
+    """
+    pool = load_question_pool()
+    if not pool or not validate_pool(pool):
+        pool = list(QUESTIONS_FALLBACK)
+    fwd = {t: [] for t in VALID_TYPES}
+    rev = {t: [] for t in VALID_TYPES}
+    for q in pool:
+        (rev if q[3] else fwd)[q[2]].append(q)
+    selected = []
+    for t in VALID_TYPES:
+        selected.extend(random.sample(fwd[t], MIN_FWD_PER_TYPE))
+        selected.extend(random.sample(rev[t], MIN_REV_PER_TYPE))
+    random.shuffle(selected)
+    return selected
+
+
+# ─────────────────────────────────────────────
+# 문항 관리자 — 시트 쓰기 함수 (v9.3)
+# 관리자 화면은 캐시를 거치지 않고 항상 시트를 직접 읽는다.
+# ─────────────────────────────────────────────
+def _questions_ws():
+    gc = get_gsheet_client()
+    ss = gc.open(SHEET_NAME)
+    try:
+        return ss.worksheet("questions")
+    except gspread.WorksheetNotFound:
+        _bootstrap_questions_sheet(ss)
+        return ss.worksheet("questions")
+
+
+def admin_fetch_records() -> list:
+    """관리자용 — 비캐시 전체 행 조회. 반환 행 순서 = 시트 행 순서."""
+    return _questions_ws().get_all_records()
+
+
+def _active_count_by_type(records: list) -> dict:
+    """유형별 (순방향, 역방향) 활성 문항 수"""
+    counts = {t: [0, 0] for t in VALID_TYPES}  # [fwd, rev]
+    for r in records:
+        typ = str(r.get("type", "")).strip()
+        if typ in VALID_TYPES and _to_bool(r.get("active", "")):
+            idx = 1 if _to_bool(r.get("reverse", "")) else 0
+            counts[typ][idx] += 1
+    return counts
+
+
+def can_remove_from_active(records: list, no) -> tuple:
+    """
+    활성 문항을 비활성/삭제해도 방향별 최소 제약(순방향 2·역방향 1)이 유지되는지 검사.
+    반환: (가능 여부, 사유 메시지)
+    비활성 문항은 항상 제거 가능.
+    """
+    target = next((r for r in records if str(r.get("no")) == str(no)), None)
+    if target is None:
+        return False, "해당 번호의 문항이 없습니다."
+    if not _to_bool(target.get("active", "")):
+        return True, ""
+    typ = str(target.get("type", "")).strip()
+    is_rev = _to_bool(target.get("reverse", ""))
+    counts = _active_count_by_type(records)
+    fwd, rev = counts.get(typ, [0, 0])
+    if is_rev and rev <= MIN_REV_PER_TYPE:
+        return False, f"'{typ}' 유형 역방향 활성 문항이 최소치({MIN_REV_PER_TYPE}개)입니다. 먼저 같은 유형의 역방향 문항을 추가하세요."
+    if (not is_rev) and fwd <= MIN_FWD_PER_TYPE:
+        return False, f"'{typ}' 유형 순방향 활성 문항이 최소치({MIN_FWD_PER_TYPE}개)입니다. 먼저 같은 유형의 순방향 문항을 추가하세요."
+    return True, ""
+
+
+def admin_add_question(text: str, typ: str, reverse: bool) -> int:
+    """새 문항 추가. no는 자동 채번(최대값+1). 반환: 부여된 no."""
+    ws = _questions_ws()
+    records = ws.get_all_records()
+    nos = []
+    for r in records:
+        try:
+            nos.append(int(r.get("no", 0)))
+        except (TypeError, ValueError):
+            continue
+    new_no = (max(nos) + 1) if nos else 1
+    ws.append_row([new_no, text.strip(), typ, "TRUE" if reverse else "FALSE", "TRUE"])
+    st.cache_data.clear()
+    return new_no
+
+
+def admin_set_active(no, active: bool) -> bool:
+    """활성/비활성 토글. active 열은 5번째 열."""
+    ws = _questions_ws()
+    records = ws.get_all_records()
+    for i, r in enumerate(records):
+        if str(r.get("no")) == str(no):
+            ws.update_cell(i + 2, 5, "TRUE" if active else "FALSE")
+            st.cache_data.clear()
+            return True
+    return False
+
+
+def admin_delete_question(no) -> bool:
+    """문항 행 삭제. 헤더가 1행이므로 레코드 i번째 = 시트 i+2행."""
+    ws = _questions_ws()
+    records = ws.get_all_records()
+    for i, r in enumerate(records):
+        if str(r.get("no")) == str(no):
+            ws.delete_rows(i + 2)
+            st.cache_data.clear()
+            return True
+    return False
+
+
+# ─────────────────────────────────────────────
+# 관리자 이메일 OTP 인증 (v9.4)
+# secrets: ADMIN_EMAILS(쉼표 구분 허용 목록), SMTP_USER, SMTP_PASSWORD
+# ─────────────────────────────────────────────
+OTP_TTL_SEC      = 600   # 코드 유효 10분
+OTP_MAX_ATTEMPTS = 5     # 검증 시도 한도
+OTP_RESEND_SEC   = 60    # 재발송 쿨다운
+
+
+def _admin_email_allowlist() -> list:
+    raw = st.secrets.get("ADMIN_EMAILS", "")
+    return [e.strip().lower() for e in str(raw).split(",") if e.strip()]
+
+
+def _send_otp_email(to_email: str, code: str) -> bool:
+    """Gmail SMTP(587/STARTTLS)로 6자리 코드 발송. 실패 시 False."""
+    user = st.secrets.get("SMTP_USER", "")
+    pw   = st.secrets.get("SMTP_PASSWORD", "")
+    if not user or not pw:
+        return False
+    body = (
+        f"AIQ 관리자 인증 코드: {code}\n\n"
+        f"10분 내에 입력하세요.\n"
+        f"본인이 요청하지 않았다면 이 메일을 무시하세요."
+    )
+    msg = MIMEText(body, _charset="utf-8")
+    msg["Subject"] = "AIQ 관리자 인증 코드"
+    msg["From"]    = user
+    msg["To"]      = to_email
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as s:
+            s.starttls(context=ssl.create_default_context())
+            s.login(user, pw)
+            s.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+
+def _store_otp(email: str, code: str) -> None:
+    """OTP는 원문이 아닌 SHA-256 해시로만 세션에 보관."""
+    st.session_state.otp_hash      = hashlib.sha256(code.encode()).hexdigest()
+    st.session_state.otp_email     = email
+    st.session_state.otp_expires   = time.time() + OTP_TTL_SEC
+    st.session_state.otp_attempts  = 0
+    st.session_state.otp_last_sent = time.time()
+
+
+def _clear_otp() -> None:
+    for k in ("otp_hash", "otp_email", "otp_expires", "otp_attempts"):
+        st.session_state.pop(k, None)
+
+
+def _verify_otp(entered: str) -> tuple:
+    """반환: (성공 여부, 실패 사유)"""
+    if not st.session_state.get("otp_hash"):
+        return False, "발송된 코드가 없습니다. 먼저 코드를 발송하세요."
+    if time.time() > st.session_state.get("otp_expires", 0):
+        _clear_otp()
+        return False, "코드가 만료되었습니다(10분). 다시 발송하세요."
+    if st.session_state.get("otp_attempts", 0) >= OTP_MAX_ATTEMPTS:
+        _clear_otp()
+        return False, "시도 횟수를 초과했습니다. 다시 발송하세요."
+    st.session_state.otp_attempts = st.session_state.get("otp_attempts", 0) + 1
+    h = hashlib.sha256(entered.strip().encode()).hexdigest()
+    if hmac.compare_digest(h, st.session_state.otp_hash):
+        _clear_otp()
+        return True, ""
+    remain = OTP_MAX_ATTEMPTS - st.session_state.otp_attempts
+    return False, f"코드가 일치하지 않습니다. (남은 시도 {remain}회)"
+
+
 def save_result(name: str, birth: str,
                 type1: str, type2: str, type_scores: dict,
                 q1: str, q1f: str,
@@ -379,7 +740,7 @@ st.markdown("""
                  border-radius:12px; margin:0 0 1.5rem; border:1px solid #DBEAFE; }
     .aiq-label { font-size:13px; font-weight:500; color:#6B7280;
                  letter-spacing:.08em; text-transform:uppercase; margin:0 0 .5rem; }
-    .aiq-value { font-size:144px; font-weight:700; color:#1D6FA8;
+    .aiq-value { font-size:clamp(96px, 24vw, 160px); font-weight:700; color:#1D6FA8;
                  line-height:1; margin:0; letter-spacing:-4px; }
     .aiq-badge-row { margin-top:.75rem; display:flex; justify-content:center;
                      gap:8px; flex-wrap:wrap; }
@@ -415,17 +776,16 @@ def init_state():
         "user_name":     "",
         "user_birth":    "",
         "consent_given": False,
-        "answers":       {},    # 20문항 응답
+        "questions":     [],    # 세션 고정 문항 세트 (v9.2)
+        "answers":       {},    # 12문항 응답
         "type_scores":   {},
         "type1":         "",
         "type2":         "",
-        # 시나리오 선택값
-        "q1":    "",   # Q1 선택 (1~4)
-        "q1f":   "",   # Q1 followup 선택 (a~d)
-        "q2a":   "",   # Q2-A 선택
-        "q2b":   "",   # Q2-B 선택
-        "q2f":   "",   # Q2 followup 선택 (a~d or e)
-        "q2f_text": "", # Q2 followup (e) 직접 입력
+        # 2단계 대화 (v10.0)
+        "dialogue":        [],
+        "transition_turn": 0,
+        "score_comment":   "",
+        "low_variance":    False,
         # 결과
         "qli_score": 0,
         "mti_score": 0,
@@ -444,7 +804,7 @@ init_state()
 # 단계 표시 바
 # ─────────────────────────────────────────────
 def step_bar(current: int):
-    steps = [(1,"유형 진단"), (2,"시나리오 A"), (3,"시나리오 B"), (4,"결과")]
+    steps = [(1,"유형 진단"), (2,"AI 대화"), (3,"결과")]
     html = '<div class="step-bar">'
     for i, (num, label) in enumerate(steps):
         if num < current:
@@ -467,9 +827,9 @@ def stage_0():
     st.markdown("""
 AI와 나는 어떻게 함께 사고하는가를 측정합니다.
 
-- **20개 행동 문항**으로 AI 협업 사고 유형을 분류합니다
-- **시나리오 2개**로 질문 설계력과 사고 전환 점수를 산출합니다
-- 소요 시간: 약 7분
+- **12개 행동 문항**으로 AI 협업 사고 유형을 분류합니다
+- **AI와의 열린 대화**(최대 7턴)로 질문 설계력과 사고 전환 점수를 산출합니다
+- 소요 시간: 약 7~10분
     """)
     st.divider()
 
@@ -502,6 +862,7 @@ AI와 나는 어떻게 함께 사고하는가를 측정합니다.
         st.session_state.user_name     = name.strip()
         st.session_state.user_birth    = birth.strip()
         st.session_state.consent_given = True
+        st.session_state.questions     = build_question_set()  # 세션 고정 (v9.2)
         st.session_state.stage = 1
         st.rerun()
 
@@ -511,14 +872,19 @@ AI와 나는 어떻게 함께 사고하는가를 측정합니다.
 def stage_1():
     step_bar(1)
     st.markdown("### AI와 나는 어떻게 함께 사고하는가")
-    st.caption("20개 행동 문항에 응답해주세요. 정답이 없으며 평소 습관을 기준으로 선택하세요.")
+    st.caption("12개 행동 문항에 응답해주세요. 정답이 없으며 평소 습관을 기준으로 선택하세요.")
     st.divider()
 
     SCALE = ["① 거의 안 그렇다", "② 가끔 그렇다", "③ 자주 그렇다", "④ 항상 그렇다"]
 
+    # 세션 고정 문항 (직접 URL 진입 등으로 비어 있으면 즉시 구성)
+    if not st.session_state.questions:
+        st.session_state.questions = build_question_set()
+    questions = st.session_state.questions
+
     with st.form("q_form"):
         answers = {}
-        for (no, text, typ, reverse) in QUESTIONS:
+        for (no, text, typ, reverse) in questions:
             st.markdown(f"**Q{no:02d}.** {text}")
             prev       = st.session_state.answers.get(no)
             prev_index = (prev - 1) if prev else None
@@ -532,16 +898,17 @@ def stage_1():
             st.markdown("")
 
         answered = len([v for v in answers.values() if v is not None])
-        st.caption(f"{answered} / 20 문항 완료")
-        submitted = st.form_submit_button("✅ 완료 — 시나리오로 이동", use_container_width=True)
+        st.caption(f"{answered} / {len(questions)} 문항 완료")
+        submitted = st.form_submit_button("✅ 완료 — AI 대화로 이동", use_container_width=True)
 
     if submitted:
         missing = [no for no, v in answers.items() if v is None]
         if missing:
             st.warning(f"아직 응답하지 않은 문항: Q{', Q'.join(f'{n:02d}' for n in missing)}")
         else:
-            st.session_state.answers     = answers
-            st.session_state.type_scores = compute_type_scores(answers)
+            st.session_state.answers      = answers
+            st.session_state.type_scores  = compute_type_scores(answers, questions)
+            st.session_state.low_variance = (len(set(answers.values())) == 1)
             t1, t2 = compute_top_types(st.session_state.type_scores)
             st.session_state.type1 = t1
             st.session_state.type2 = t2
@@ -553,179 +920,60 @@ def stage_1():
 # ─────────────────────────────────────────────
 def stage_2():
     step_bar(2)
-    st.markdown('<div class="scn-box"><p class="scn-title">두 사람의 조언</p><p class="scn-text">당신은 어떤 일을 시작할지 말지 고민 중이다. 믿을 만한 두 사람에게 의견을 구했더니, 한 사람은 "지금이 적기다, 바로 해라"라고 하고, 다른 한 사람은 "지금은 때가 아니다, 기다려라"라고 한다. 둘 다 당신을 잘 알고 진심으로 조언하고 있다.</p></div>', unsafe_allow_html=True)
-    st.caption("정답이 없습니다. 가장 자연스럽게 떠오르는 것을 고르세요.")
+    st.markdown("### AI와의 열린 대화")
+    st.markdown(f"""
+<div class="scn-box"><p class="scn-title">논의 주제</p>
+<p class="scn-text">AI와 함께 <strong>{DIALOGUE_TOPIC}</strong>에 대해 논의합니다.<br>
+AI에게 가장 먼저 어떤 질문을 하시겠습니까? 자유롭게 작성해 주세요.</p></div>
+""", unsafe_allow_html=True)
+    st.caption(f"대화는 최대 {MAX_USER_TURNS}번까지 이어갈 수 있고, 충분하다고 느끼면 언제든 마칠 수 있습니다.")
     st.divider()
 
-    # Q1
-    q1 = st.radio(
-        "**Q1. 이 상황에서 가장 먼저 하고 싶은 것은?**",
-        options=["1","2","3","4"],
-        format_func=lambda x: {
-            "1": "① 더 신뢰하는 쪽의 말을 따른다",
-            "2": "② 두 사람에게 각각 왜 그렇게 생각하는지 이유를 묻는다",
-            "3": "③ 두 사람이 서로 다른 기준으로 보고 있을 수 있다고 생각한다",
-            "4": "④ 지금 당장 결정해야 하는 상황인지부터 의심해본다",
-        }[x],
-        index=None, key="s2_q1"
-    )
+    dialogue = st.session_state.dialogue
+    user_turns = sum(1 for m in dialogue if m["role"] == "user")
 
-    if q1:
-        st.divider()
-        followup_questions = {
-            "1": "그 사람을 더 신뢰하는 이유는?",
-            "2": "이유를 물어보려는 것은 왜인가?",
-            "3": "기준이 다르다면, 어떤 의미라고 생각하는가?",
-            "4": '"지금 결정해야 하는가"를 의심하는 이유는?',
-        }
-        followup_options = {
-            "1": {
-                "a": "(a) 나를 더 오래, 더 잘 알기 때문에",
-                "b": "(b) 비슷한 상황을 경험해봤기 때문에",
-                "c": "(c) 과거에 그 사람 판단이 맞았던 적이 있기 때문에",
-                "d": "(d) 딱히 이유는 없다 — 그냥 그 말이 더 끌린다",
-            },
-            "2": {
-                "a": "(a) 둘 중 더 설득력 있는 쪽을 따르려고",
-                "b": "(b) 각자 무엇을 기준으로 보고 있는지 파악하려고",
-                "c": "(c) 두 사람의 전제 자체가 다를 수 있다고 생각해서",
-                "d": "(d) 결정을 미루고 싶어서",
-            },
-            "3": {
-                "a": "(a) 한 사람은 급하고 한 사람은 신중한 성격 차이일 것이다",
-                "b": "(b) 둘이 '적기'를 판단하는 기준 자체가 다를 것이다",
-                "c": "(c) 한 사람이 내 상황을 더 잘 알고 있어서 그럴 것이다",
-                "d": "(d) 잘 모르겠다",
-            },
-            "4": {
-                "a": "(a) 아직 정보가 부족해서",
-                "b": "(b) 두 조언이 상충한다는 것 자체가 전제에 문제가 있다는 신호 같아서",
-                "c": "(c) 결정을 미루면 상황이 더 명확해질 것 같아서",
-                "d": "(d) '지금 시작할지 말지'라는 질문 자체가 잘못 설정됐을 수 있어서",
-            },
-        }
+    # 대화 이력 표시
+    for m in dialogue:
+        with st.chat_message("user" if m["role"] == "user" else "assistant"):
+            st.markdown(m["content"])
 
-        q1f = st.radio(
-            f"**Q1-F. {followup_questions[q1]}**",
-            options=list(followup_options[q1].keys()),
-            format_func=lambda x: followup_options[q1][x],
-            index=None, key="s2_q1f"
+    # 입력 (상한 도달 전까지)
+    if user_turns < MAX_USER_TURNS:
+        user_msg = st.chat_input(
+            "첫 질문을 입력하세요" if user_turns == 0 else "후속 질문 또는 의견을 입력하세요"
         )
+        if user_msg and user_msg.strip():
+            dialogue.append({"role": "user", "content": user_msg.strip()})
+            with st.chat_message("user"):
+                st.markdown(user_msg.strip())
+            with st.spinner("AI가 답변 중..."):
+                reply = generate_ai_reply(dialogue)
+            dialogue.append({"role": "assistant", "content": reply})
+            st.session_state.dialogue = dialogue
+            st.rerun()
+    else:
+        st.info(f"최대 {MAX_USER_TURNS}턴에 도달했습니다. 논의를 마치고 결과를 확인하세요.")
 
-        if q1f:
-            st.divider()
-            if st.button("다음 시나리오로 →", type="primary", use_container_width=True):
-                st.session_state.q1  = q1
-                st.session_state.q1f = q1f
-                st.session_state.stage = 3
-                st.rerun()
+    # 종료 버튼 — 최소 발화 수 충족 시
+    if user_turns >= MIN_TURNS_TO_FINISH:
+        st.divider()
+        if st.button("논의 마치고 결과 보기 →", type="primary", use_container_width=True):
+            with st.spinner("응답을 분석 중입니다..."):
+                qli, mti, tt, cm = score_dialogue(st.session_state.dialogue)
+            st.session_state.qli_score       = qli
+            st.session_state.mti_score       = mti
+            st.session_state.aiq_index       = compute_aiq(qli, mti)
+            st.session_state.transition_turn = tt
+            st.session_state.score_comment   = cm
+            st.session_state.stage = 3
+            st.rerun()
+    elif user_turns == 1:
+        st.caption("AI의 답변을 보고 한 번 이상 더 이어가면 논의를 마칠 수 있습니다.")
 
 # ─────────────────────────────────────────────
-# stage_3: 시나리오 B — MTI 측정
+# stage_3: 결과 리포트
 # ─────────────────────────────────────────────
 def stage_3():
-    step_bar(3)
-    # q1, q1f — stage_2에서 저장된 값 먼저 복원
-    q1  = st.session_state.q1
-    q1f = st.session_state.q1f
-
-    st.markdown('<div class="scn-box"><p class="scn-title">친구의 부탁</p><p class="scn-text">친구가 주말에 자기 일을 도와달라고 부탁했고, 당신은 그러기로 했다. 그런데 그 주말에 당신에게도 중요한 일이 생겼다. 친구는 이미 당신이 온다고 믿고 준비를 시작했다.</p></div>', unsafe_allow_html=True)
-    st.caption("정답이 없습니다. 가장 자연스럽게 떠오르는 것을 고르세요.")
-    st.divider()
-
-    # Q2-A
-    q2a = st.radio(
-        "**Q2-A. 이 상황을 어떻게 풀겠는가?**",
-        options=["1","2","3","4"],
-        format_func=lambda x: {
-            "1": "① 약속했으니 친구를 돕는다",
-            "2": "② 솔직하게 말하고 일정을 조율한다",
-            "3": "③ 친구가 진짜 필요한 게 내 도움인지, 다른 방법도 있는지 먼저 확인한다",
-            "4": "④ 약속의 의미와 상황 변화 중 무엇이 더 중요한지 따져본다",
-        }[x],
-        index=None, key="s3_q2a"
-    )
-
-    if q2a:
-        st.divider()
-        # 조건 변화 투입
-        st.info("💡 **새로운 정보**: 알고 보니 친구가 부탁한 일은 당신이 아니어도 할 수 있는 일이었다.")
-
-        q2b = st.radio(
-            "**Q2-B. 이 사실을 알게 됐다. 생각이 바뀌는가?**",
-            options=["1","2","3","4"],
-            format_func=lambda x: {
-                "1": "① 그래도 약속은 지킨다 — 내가 가기로 했으니까",
-                "2": "② 다른 사람을 구해주는 방향으로 생각이 바뀐다",
-                "3": "③ 처음부터 내가 꼭 가야 한다고 생각한 게 틀렸다",
-                "4": "④ 이건 '내가 가느냐'의 문제가 아니라 '친구가 무엇을 필요로 하느냐'의 문제였다",
-            }[x],
-            index=None, key="s3_q2b"
-        )
-
-        if q2b:
-            st.divider()
-            # Q2-F — 전환 여부에 따라 질문 다르게
-            if q2b == "1":
-                f_question = "생각이 바뀌지 않는 이유는?"
-                f_options = {
-                    "a": "(a) 약속은 지키는 것이 원칙이다",
-                    "b": "(b) 친구가 이미 준비를 시작했으니 지금 바꾸면 피해가 크다",
-                    "c": "(c) 내가 가는 게 친구에게 더 중요한 의미일 수 있다",
-                    "d": "(d) 솔직히 어떻게 해야 할지 모르겠다",
-                    "e": "(e) 위에 해당하지 않는다 — 직접 입력",
-                }
-            else:
-                f_question = "생각이 바뀐 이유는?"
-                f_options = {
-                    "a": "(a) 새 정보가 생겼으니 판단을 바꾸는 게 맞다",
-                    "b": "(b) 내가 처음 판단할 때 빠뜨린 조건이 있었다",
-                    "c": "(c) 문제를 다른 각도에서 보게 됐다",
-                    "d": "(d) 사실 처음부터 확신이 없었는데 이유가 생긴 것뿐이다",
-                    "e": "(e) 위에 해당하지 않는다 — 직접 입력",
-                }
-
-            q2f = st.radio(
-                f"**Q2-F. {f_question}**",
-                options=list(f_options.keys()),
-                format_func=lambda x: f_options[x],
-                index=None, key="s3_q2f"
-            )
-
-            q2f_text = ""
-            if q2f == "e":
-                q2f_text = st.text_area(
-                    "직접 입력해주세요 (200자 이하)",
-                    max_chars=200,
-                    height=80,
-                    key="s3_q2f_text"
-                )
-
-            if q2f and (q2f != "e" or q2f_text.strip()):
-                st.divider()
-                if st.button("결과 보기 →", type="primary", use_container_width=True):
-                    # 점수 산출
-                    qli = QLI_MATRIX.get((q1, q1f), 5) if (q1, q1f) in QLI_MATRIX else 5
-                    mti_key = (q2b, q2f) if q2f != "e" else (q2b, "a")
-                    mti = MTI_MATRIX.get(mti_key, 5)
-                    aiq = compute_aiq(qli, mti)
-
-                    st.session_state.q2a      = q2a
-                    st.session_state.q2b      = q2b
-                    st.session_state.q2f      = q2f
-                    st.session_state.q2f_text = q2f_text.strip()
-                    st.session_state.qli_score = qli
-                    st.session_state.mti_score = mti
-                    st.session_state.aiq_index = aiq
-                    st.session_state.stage = 4
-                    st.rerun()
-
-    # (q1, q1f는 함수 첫 부분에서 복원 완료)
-
-# ─────────────────────────────────────────────
-# stage_4: 결과 리포트
-# ─────────────────────────────────────────────
-def stage_4():
     type1     = st.session_state.type1
     type2     = st.session_state.type2
     type_sc   = st.session_state.type_scores
@@ -736,17 +984,23 @@ def stage_4():
     # 저장 — 1회만
     if not st.session_state.save_attempted:
         st.session_state.save_attempted = True
+        dlg = st.session_state.dialogue
+        first_q  = next((m["content"] for m in dlg if m["role"] == "user"), "")[:500]
+        u_turns  = sum(1 for m in dlg if m["role"] == "user")
+        import json as _json
+        transcript_json = _json.dumps(dlg, ensure_ascii=False)[:40000]
+        # 시트 열 재활용: q1=첫 질문 / q1f=발화 수 / q2a=전환 턴 / q2f_text=대화 전문(JSON)
         serial = save_result(
             name=st.session_state.user_name,
             birth=st.session_state.user_birth,
             type1=type1, type2=type2,
             type_scores=type_sc,
-            q1=st.session_state.q1,
-            q1f=st.session_state.q1f,
-            q2a=st.session_state.q2a,
-            q2b=st.session_state.q2b,
-            q2f=st.session_state.q2f,
-            q2f_text=st.session_state.q2f_text,
+            q1=first_q,
+            q1f=str(u_turns),
+            q2a=str(st.session_state.transition_turn),
+            q2b="",
+            q2f="",
+            q2f_text=transcript_json,
             qli=qli, mti=mti, aiq=aiq,
             answers=st.session_state.answers
         )
@@ -769,7 +1023,7 @@ def stage_4():
         <span><strong>응답자</strong>{name_disp} ({birth_disp})</span>
         <span><strong>시리얼</strong>{serial_disp}</span>
         <span><strong>진단일</strong>{diag_time}</span>
-        <span><strong>버전</strong>AIQ v9.0 · 파일럿</span>
+        <span><strong>버전</strong>AIQ v10.0 · 프로토타입</span>
       </div>
     </div>
     ''', unsafe_allow_html=True)
@@ -790,16 +1044,26 @@ def stage_4():
         combo_name = type1.replace("형", "")
         combo_desc = TYPE_DESC.get(type1, "")
 
+    # 점수 카드 — 점수만 단독·대형 표시 (v10.0)
     st.markdown(f'''
     <div class="aiq-hero">
       <p class="aiq-label">AIQ</p>
       <p class="aiq-value">{aiq}</p>
-      <div class="aiq-badge-row">
-        <span class="aiq-badge">{combo_name}</span>
-      </div>
-      <p style="margin:.6rem 0 0; font-size:13px; color:#6B7280;">"{combo_desc}"</p>
     </div>
     ''', unsafe_allow_html=True)
+
+    # 유형 카드 — 점수와 분리 (v10.0)
+    st.markdown(f'''
+    <div style="text-align:center; padding:1.25rem 1rem; background:#FFFFFF;
+                border:1px solid #E5E7EB; border-radius:12px; margin:0 0 1.5rem;">
+      <span class="aiq-badge" style="font-size:14px; padding:5px 16px;">{combo_name}</span>
+      <p style="margin:.7rem 0 0; font-size:13px; color:#6B7280;">"{combo_desc}"</p>
+    </div>
+    ''', unsafe_allow_html=True)
+
+    # 무변별 응답 경고 (v10.0)
+    if st.session_state.get("low_variance", False):
+        st.warning("모든 문항에 동일한 응답을 하셨습니다. 유형 판정의 신뢰도가 낮으므로 참고용으로만 활용하세요.")
 
     # 유형 설명
     axis = TYPE_AXIS.get(type1, ("",""))
@@ -912,11 +1176,150 @@ def stage_4():
         st.rerun()
 
 # ─────────────────────────────────────────────
+# 관리자 화면 (v9.3) — URL: ?mode=admin
+# ─────────────────────────────────────────────
+def render_admin():
+    st.markdown("## AIQ 문항 관리 (관리자)")
+
+    allow = _admin_email_allowlist()
+    if not allow:
+        st.error("ADMIN_EMAILS secret이 설정되지 않았습니다. (쉼표 구분 이메일 목록)")
+        st.stop()
+    if not (st.secrets.get("SMTP_USER", "") and st.secrets.get("SMTP_PASSWORD", "")):
+        st.error("SMTP_USER / SMTP_PASSWORD secret이 설정되지 않았습니다.")
+        st.stop()
+
+    # 인증 — 이메일 OTP (v9.4)
+    if not st.session_state.get("admin_authed", False):
+        st.markdown("#### 관리자 이메일 인증")
+        email = st.text_input("관리자 이메일", key="adm_email_in",
+                              placeholder="등록된 관리자 이메일 입력")
+
+        c1, c2 = st.columns([1, 1])
+        if c1.button("인증 코드 발송", type="primary"):
+            em = email.strip().lower()
+            if em not in allow:
+                st.error("등록되지 않은 관리자 이메일입니다.")
+            elif time.time() - st.session_state.get("otp_last_sent", 0) < OTP_RESEND_SEC:
+                wait = int(OTP_RESEND_SEC - (time.time() - st.session_state.get("otp_last_sent", 0)))
+                st.warning(f"재발송은 {wait}초 후에 가능합니다.")
+            else:
+                code = f"{_pysecrets.randbelow(1000000):06d}"
+                if _send_otp_email(em, code):
+                    _store_otp(em, code)
+                    st.success("인증 코드를 발송했습니다. 메일함(스팸함 포함)을 확인하세요.")
+                else:
+                    st.error("메일 발송 실패 — SMTP_USER / SMTP_PASSWORD 설정을 확인하세요.")
+
+        if st.session_state.get("otp_hash"):
+            entered = st.text_input("6자리 인증 코드", max_chars=6, key="adm_otp_in")
+            if c2.button("코드 확인"):
+                ok, msg = _verify_otp(entered)
+                if ok:
+                    st.session_state.admin_authed = True
+                    st.rerun()
+                else:
+                    st.error(msg)
+        st.stop()
+
+    # 데이터 로드 (비캐시)
+    try:
+        records = admin_fetch_records()
+    except Exception as e:
+        st.error(f"시트 연결 실패: {e}")
+        st.stop()
+
+    # 유형별 활성 현황
+    counts = _active_count_by_type(records)
+    cols = st.columns(4)
+    for i, t in enumerate(VALID_TYPES):
+        fwd, rev = counts[t]
+        warn = " ⚠️" if (fwd <= MIN_FWD_PER_TYPE or rev <= MIN_REV_PER_TYPE) else ""
+        cols[i].metric(t, f"순{fwd}·역{rev}{warn}")
+    if any(counts[t][0] < MIN_FWD_PER_TYPE or counts[t][1] < MIN_REV_PER_TYPE for t in VALID_TYPES):
+        st.warning(f"유형별 순방향 {MIN_FWD_PER_TYPE}·역방향 {MIN_REV_PER_TYPE} 미만이면 풀이 사용되지 않고 기본 문항으로 대체됩니다.")
+    st.divider()
+
+    # 새 문항 추가
+    with st.expander("➕ 새 문항 추가", expanded=False):
+        new_text = st.text_input("문항 텍스트", key="adm_new_text")
+        c1, c2 = st.columns([1, 1])
+        new_type = c1.selectbox("유형", VALID_TYPES, key="adm_new_type")
+        new_rev  = c2.checkbox("역코딩 문항", key="adm_new_rev")
+        if st.button("추가", key="adm_add_btn"):
+            if not new_text.strip():
+                st.error("문항 텍스트를 입력하세요.")
+            else:
+                no = admin_add_question(new_text, new_type, new_rev)
+                st.success(f"문항 추가 완료 (no={no})")
+                st.rerun()
+
+    st.divider()
+    st.markdown(f"**전체 문항 {len(records)}개** · 변경은 사용자 화면에 즉시 반영됩니다.")
+
+    # 문항 목록
+    for r in records:
+        no_  = r.get("no", "")
+        text = str(r.get("text", ""))
+        typ  = str(r.get("type", "")).strip()
+        rev  = _to_bool(r.get("reverse", ""))
+        act  = _to_bool(r.get("active", ""))
+
+        c1, c2, c3, c4, c5 = st.columns([0.6, 5, 1.2, 1.4, 1.2])
+        c1.markdown(f"`{no_}`")
+        style = "" if act else "color:gray;text-decoration:line-through;"
+        rev_tag = " · 역코딩" if rev else ""
+        c2.markdown(f"<span style='{style}'>{text}</span><br><small>{typ}{rev_tag}</small>",
+                    unsafe_allow_html=True)
+
+        # 활성/비활성 토글
+        if act:
+            if c3.button("비활성", key=f"adm_off_{no_}"):
+                ok, msg = can_remove_from_active(records, no_)
+                if ok:
+                    admin_set_active(no_, False)
+                    st.rerun()
+                else:
+                    st.error(msg)
+        else:
+            if c3.button("활성", key=f"adm_on_{no_}"):
+                admin_set_active(no_, True)
+                st.rerun()
+
+        # 삭제 — 2단계 확인
+        pending = st.session_state.get("adm_del_pending")
+        if pending == no_:
+            if c4.button("⚠️ 확인 삭제", key=f"adm_delc_{no_}", type="primary"):
+                ok, msg = can_remove_from_active(records, no_)
+                if ok:
+                    admin_delete_question(no_)
+                    st.session_state.adm_del_pending = None
+                    st.rerun()
+                else:
+                    st.session_state.adm_del_pending = None
+                    st.error(msg)
+            if c5.button("취소", key=f"adm_delx_{no_}"):
+                st.session_state.adm_del_pending = None
+                st.rerun()
+        else:
+            if c4.button("삭제", key=f"adm_del_{no_}"):
+                st.session_state.adm_del_pending = no_
+                st.rerun()
+
+    st.divider()
+    if st.button("로그아웃"):
+        st.session_state.admin_authed = False
+        st.rerun()
+
+
+# ─────────────────────────────────────────────
 # 라우터
 # ─────────────────────────────────────────────
-stage = st.session_state.get("stage", 0)
-if   stage == 0: stage_0()
-elif stage == 1: stage_1()
-elif stage == 2: stage_2()
-elif stage == 3: stage_3()
-elif stage == 4: stage_4()
+if st.query_params.get("mode") == "admin":
+    render_admin()
+else:
+    stage = st.session_state.get("stage", 0)
+    if   stage == 0: stage_0()
+    elif stage == 1: stage_1()
+    elif stage == 2: stage_2()
+    else:            stage_3()
