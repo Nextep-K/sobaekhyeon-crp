@@ -1,1325 +1,979 @@
-# =============================================================================
-# AIQ 파일럿 — Streamlit 앱
-# Version: v10.0 (2026.06) — 프로토타입 전면 개편
-#
-# 변경 이력:
-#   v10.0 — 측정 구조 재설계 (프로토타입)
-#          · 1단계: 12문항(유형별 순방향2+역방향1) — 유형 분류 전용, 점수 미산출
-#          · 2단계: 시나리오 객관식 폐지 → AI와 열린 대화 (최대 7턴, 조기 종료 가능)
-#          · 채점: 대화 종료 후 전체 로그 일괄 LLM 채점 (QLI 4지표 / MTI 3전환차원)
-#          · AIQ = 100 + (QLI + MTI − 10) × 5  [공식 유지]
-#          · 결과 화면: 점수 카드와 유형 카드 분리
-#          · 1단계 무변별 응답(전부 동일값) 플래그 표시
-#
-#   v9.4 — 관리자 인증을 이메일 OTP 방식으로 교체
-#          · ADMIN_EMAILS 허용 목록 + Gmail SMTP 6자리 코드 발송
-#          · 코드 유효 10분 / 시도 5회 제한 / 재발송 60초 쿨다운
-#          · OTP는 해시로만 세션에 보관 (hmac 상수시간 비교)
-#          · 필요 secrets: ADMIN_EMAILS, SMTP_USER, SMTP_PASSWORD
-#
-#   v9.3 — 앱 내 문항 관리자 화면 추가 (?mode=admin)
-#          · ADMIN_PASSWORD secret 인증 (v9.4에서 OTP로 대체)
-#          · 문항 추가 / 활성·비활성 토글 / 삭제 (2단계 확인)
-#          · 유형별 최소 5문항 제약 위반 시 비활성·삭제 차단
-#          · 변경 즉시 캐시 무효화 — 사용자 화면 실시간 반영
-#
-#   v9.2 — L1 문항 풀 Google Sheets 외부화
-#          · questions 탭에서 활성 문항 로드 (no/text/type/reverse/active)
-#          · 유형별 5문항 랜덤 추출 → 20문항 세션 고정
-#          · 탭 없으면 기존 20문항으로 자동 생성(bootstrap)
-#          · 시트 오류·제약 미달 시 코드 내 QUESTIONS_FALLBACK으로 폴백
-#
-#   v9.1 — 유형 보고서 텍스트를 GitHub MD 파일에서 동적 호출
-#          · load_content() — raw URL에서 MD 파일 로드, @st.cache_data(ttl=3600)
-#          · parse_content() — MD 파싱 → {(type1,type2): 섹션 dict}
-#          · 코드 재배포 없이 MD 파일만 수정하면 텍스트 즉시 반영
-#          · 호출 실패 시 코드 내 TYPE_COMBOS/TYPE_DESC fallback 유지
-#
-#   v9.0 — 서사형 객관식 구조 + v7.4 연결 방식 + 단일 시트 저장
-# =============================================================================
+# -*- coding: utf-8 -*-
+"""
+AIQ 파일럿 진단 앱 (단일 파일) — 설계기준 v0.3 전체 반영
+- 인증(사번10자리 + 이메일 6자리 코드) → [무작위 순서] {L1 설문 · L3 대화} → 채점 → 저장
+- 점수는 보류-후-일괄(유효 200) 모델이라 응시 시점에는 표시하지 않음(유형·근거 코멘트만)
+- 의존성: streamlit, openai, gspread, google-auth, pytz + 표준라이브러리(smtplib, secrets, email, datetime, json, statistics, random)
+- 비밀값은 .streamlit/secrets.toml 의 EMAIL_ADDRESS / EMAIL_APP_PW / OPENAI_API_KEY / SHEET_ID / [gcp_service_account]
+"""
 
-import streamlit as st
-from openai import OpenAI
-import re
-import requests
-from datetime import datetime
-import pytz
-import gspread
-from google.oauth2.service_account import Credentials
+import json
+import random
+import secrets as pysecrets
 import smtplib
-import ssl
-import time
-import hashlib
-import hmac
-import secrets as _pysecrets
+import statistics
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
+from email.utils import formataddr
 
-# ─────────────────────────────────────────────
-# 설정
-# ─────────────────────────────────────────────
-client    = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-SHEET_NAME = "AIQ_Pilot"
-KST        = pytz.timezone("Asia/Seoul")
+import pytz
+import streamlit as st
 
-st.set_page_config(
-    page_title="AIQ 진단",
-    layout="centered",
-    initial_sidebar_state="collapsed"
-)
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG (구현명세서 §0 디폴트 · §1~§5)
+# ──────────────────────────────────────────────────────────────────────────────
+APP_VERSION = "AIQ v-next 0.3 · 파일럿"
+KST = pytz.timezone("Asia/Seoul")
 
-# ─────────────────────────────────────────────
-# AIQ 20문항 정의 (VF1 확정본) — 시트 로드 실패 시 폴백
-# ─────────────────────────────────────────────
-QUESTIONS_FALLBACK = [
-    (1,  "AI에게 질문을 보내기 전에 내가 원하는 결과를 먼저 정의한다",        "설계자", False),
-    (2,  "AI가 답을 주면 그 흐름에 맞춰 대화를 이어간다",                     "의존",   False),
-    (3,  "AI가 새로운 시각을 제시해도 내 기존 생각을 쉽게 바꾸지 않는다",     "상상가", True),
-    (4,  "AI의 지시나 제안을 최대한 빠르게 실행에 옮긴다",                     "실행",   False),
-    (5,  "AI 대화에서 내가 놓친 전제나 조건을 스스로 되짚어본다",              "설계자", False),
-    (6,  "AI가 틀려도 그 답을 기준으로 판단하는 경우가 있다",                  "의존",   False),
-    (7,  "AI가 제안한 방향보다 내 아이디어로 대화를 이끌고 싶다",              "상상가", False),
-    (8,  "AI 결과물은 내 기준에 맞게 반드시 수정해서 사용한다",                "설계자", True),
-    (9,  "AI가 준 내용을 다른 도구나 방법과 결합해 바로 적용한다",             "실행",   False),
-    (10, "AI와 대화하면서 예상치 못한 연결을 발견하는 것이 즐겁다",            "상상가", False),
-    (11, "AI가 제안한 방식이 내 방식보다 낫다고 느끼면 그냥 따른다",           "의존",   False),
-    (12, "AI가 내 질문 의도를 잘못 이해했을 때 즉시 교정 질문을 보낸다",       "설계자", False),
-    (13, "AI 결과를 받으면 바로 적용하기보다 한 번 더 확인한다",               "실행",   True),
-    (14, "AI와 대화하다 보면 처음 생각지 못한 가능성이 머릿속에 펼쳐진다",     "상상가", False),
-    (15, "AI를 쓸 때 내가 원하는 출력 형식을 명시적으로 지정한다",             "설계자", False),
-    (16, "AI가 준 단계별 지시를 순서대로 따라가는 것이 효율적이라고 생각한다", "실행",   False),
-    (17, "AI와 대화할 때 '만약 ~라면'처럼 가정을 많이 사용한다",              "상상가", False),
-    (18, "AI 결과가 마음에 들지 않으면 다시 시도하기보다 그냥 쓴다",           "의존",   True),
-    (19, "AI가 준 코드나 템플릿을 즉시 실행해보며 결과를 확인한다",            "실행",   False),
-    (20, "AI 없이 스스로 문제를 해결하는 것이 부담스럽다",                     "의존",   False),
+CODE_TTL_MIN = 10        # 인증 코드 유효(분)
+EMP_ID_LEN = 10          # 사번 자릿수(변경 시 이 값만 수정)
+CODE_COOLDOWN_SEC = 60   # 재발송 쿨다운(초)
+CODE_MAX_ATTEMPTS = 3    # 실패 잠금
+TYPE_GAP_T = 2           # 1·2순위 점수차 임계(미만이면 '복합')
+K_PASSES = 3             # 채점 반복
+SCORING_TEMP = 0.3       # 채점 온도
+PARTNER_TEMP = 0.7       # 대화 파트너 온도
+MAX_USER_TURNS = 7       # 사용자 발화 상한
+PERTURB_AFTER = 2        # n번째 사용자 발화 직후 도전질문 삽입
+NORM_THRESHOLD = 200     # 유효 응답 정규화 트리거
+
+RESP_WS = "responses"
+IDMAP_WS = "id_map"
+META_WS = "meta"         # norm_locked 등 상태
+
+# ── 토픽(일상 딜레마, 지식장벽 低·추론부하 高) ────────────────────────────────
+TOPICS = {
+    "T1": {
+        "title": "이사",
+        "dilemma": "직장과 가까운 비싼 도심 vs 멀지만 저렴하고 환경 좋은 외곽, 어디로 이사할지",
+        "intro": "도심은 가깝지만 비싸고, 외곽은 멀지만 저렴하고 환경이 좋습니다. 어떤 점부터 따져볼까요?",
+    },
+    "T2": {
+        "title": "진로",
+        "dilemma": "안정적이지만 성장 느린 자리 vs 불안정하지만 성장 빠른 기회, 무엇을 택할지",
+        "intro": "안정과 성장은 자주 부딪칩니다. 지금 가장 중요하게 보는 기준은 무엇인가요?",
+    },
+    "T3": {
+        "title": "우선순위",
+        "dilemma": "한정된 시간에 중요한 일 A와 급한 일 B가 충돌할 때 어떻게 배분할지",
+        "intro": "중요한 일과 급한 일이 부딪칩니다. 지금 상황을 어떻게 보고 계신가요?",
+    },
+}
+
+# ── L1 문항(성향별 5 = 순3·역2) + 일관성 점검 2 ───────────────────────────────
+# key: F(정방향) / R(역방향)  ·  type: 설계/상상/실행/의존  ·  CK: 일관성(유형 미합산)
+L1_ITEMS = [
+    # 설계자형
+    {"code": "D1", "type": "설계", "key": "F", "text": "질문을 보내기 전에 원하는 결과물의 형태나 관점을 먼저 정했다."},
+    {"code": "D2", "type": "설계", "key": "F", "text": "AI에게 출력 형식·범위·조건을 구체적으로 지정했다."},
+    {"code": "D3", "type": "설계", "key": "F", "text": "의도가 잘못 전달됐을 때 곧바로 교정 질문을 보냈다."},
+    {"code": "D4", "type": "설계", "key": "R", "text": "무엇을 얻을지 정하지 않은 채 일단 AI에게 물어봤다."},
+    {"code": "D5", "type": "설계", "key": "R", "text": "AI 답을 받은 뒤 내 기준으로 다시 따져보지 않고 그대로 진행했다."},
+    # 상상가형
+    {"code": "I1", "type": "상상", "key": "F", "text": "“만약 ~라면” 같은 가정을 던지며 대화를 확장했다."},
+    {"code": "I2", "type": "상상", "key": "F", "text": "예상치 못한 연결이나 새로운 관점을 발견하려고 질문했다."},
+    {"code": "I3", "type": "상상", "key": "F", "text": "정답보다 탐색 자체를 목적으로 AI와 대화했다."},
+    {"code": "I4", "type": "상상", "key": "R", "text": "떠오른 아이디어를 더 펼치지 않고 한두 마디로 끝냈다."},
+    {"code": "I5", "type": "상상", "key": "R", "text": "새로운 방향이 보여도 처음 정한 범위 안에서만 질문했다."},
+    # 실행형
+    {"code": "X1", "type": "실행", "key": "F", "text": "AI가 준 결과를 곧바로 적용하거나 실행해봤다."},
+    {"code": "X2", "type": "실행", "key": "F", "text": "AI 결과를 내 상황에 맞게 고쳐서 사용했다."},
+    {"code": "X3", "type": "실행", "key": "F", "text": "받은 답을 다른 도구·방법과 결합해 써먹었다."},
+    {"code": "X4", "type": "실행", "key": "R", "text": "AI 결과를 실제로 써보지 않고 읽기만 하고 넘어갔다."},
+    {"code": "X5", "type": "실행", "key": "R", "text": "결과를 고치거나 적용하기보다 그대로 두었다."},
+    # 의존형
+    {"code": "P1", "type": "의존", "key": "F", "text": "AI가 준 답을 별 의심 없이 그대로 받아들였다."},
+    {"code": "P2", "type": "의존", "key": "F", "text": "AI 답이 마음에 안 들어도 다시 시도하지 않고 그냥 썼다."},
+    {"code": "P3", "type": "의존", "key": "F", "text": "AI 없이 혼자 문제를 푸는 것이 부담스러웠다."},
+    {"code": "P4", "type": "의존", "key": "R", "text": "AI 답이 내 상황과 다르다고 느껴 반론하거나 수정 요청을 했다."},
+    {"code": "P5", "type": "의존", "key": "R", "text": "AI 답의 한계나 틀린 점을 스스로 짚어봤다."},
+    # 일관성 점검(유형 미합산)
+    {"code": "CK1", "type": "CK", "key": "F", "text": "AI에게 묻기 전에 목표를 분명히 해두었다."},   # D1 패러프레이즈
+    {"code": "CK2", "type": "CK", "key": "F", "text": "AI 답을 검토 없이 신뢰하는 편이었다."},        # P1 패러프레이즈
 ]
+L1_SCALE = {1: "거의 안 함", 2: "가끔", 3: "자주", 4: "거의 매번"}
 
-TYPE_LABELS = {"설계자": "설계자형", "상상가": "상상가형", "실행": "실행형", "의존": "의존형"}
+# ── L2 자기효능감(태도 4점, 유형 미합산) ──────────────────────────────────────
+L2_ITEMS = [
+    {"code": "E1", "key": "F", "text": "나는 AI를 활용해 원하는 결과를 얻을 자신이 있다."},
+    {"code": "E2", "key": "F", "text": "새로운 AI 도구도 금방 익혀 쓸 수 있다."},
+    {"code": "E3", "key": "R", "text": "AI를 제대로 활용하지 못할까 봐 걱정된다."},
+    {"code": "E4", "key": "R", "text": "AI를 쓸 때 내가 잘하고 있는지 확신이 안 선다."},
+]
+L2_SCALE = {1: "전혀 아니다", 2: "아니다", 3: "그렇다", 4: "매우 그렇다"}
 
-TYPE_AXIS = {
-    "설계자형": ("QLI↑", "CRP↑"),
-    "상상가형": ("QLI↑", "CRP↓"),
-    "실행형":   ("QLI↓", "CRP↑"),
-    "의존형":   ("QLI↓", "CRP↓"),
-}
-
-TYPE_DESC = {
-    "설계자형": "AI를 도구로 부리는 사람. 질문 전에 목적을 정의하고, 결과를 받으면 재조립한다.",
-    "상상가형": "AI와의 대화가 지적 유희인 사람. 질문의 수준은 높고 탐색의 폭은 넓지만, 그 풍요로운 대화가 결과물로 착지하지 못한다.",
-    "실행형":   "일단 받고, 고치면서 나아가는 사람. 빠르고 실용적이지만, 더 좋은 질문이 더 좋은 결과를 만든다는 사실을 가끔 잊는다.",
-    "의존형":   "AI가 주면 받는 사람. AI와 공생하는 게 아니라 AI에 기대고 있는 상태. AI를 깊이 신뢰하지만, 그 신뢰가 무비판적 수용으로 이어진다.",
-}
-
-# 4유형 × 4수준 코멘트 + 권고 (VF1 확정본)
-# 수준 기준: 17~20=뚜렷 / 13~16=보통 / 9~12=복합 / 5~8=미형성
-TYPE_COMMENTS = {
-    "설계자형": {
-        "뚜렷":  ("AI가 당신을 살짝 두려워할 것 같습니다. 질문하기 전에 이미 답의 윤곽이 머릿속에 있고, AI는 그것을 완성하는 도구에 가깝습니다. 이 관계에서 갑은 당신입니다.",
-                  "한 AI에게 초안을, 다른 AI에게 반론을 맡겨보세요. 설계자의 다음 단계는 AI를 병렬로 운용하는 것입니다."),
-        "보통":  ("제법 잘 다루고 있습니다. 가끔 AI 답을 그냥 쓰는 순간도 있지만 대체로 당신이 설계하고 AI가 실행합니다. 방향은 맞습니다.",
-                  "AI 결과를 받은 후 '이걸 반박해봐'를 한 번 더 시도해보세요. 재구성의 깊이가 달라집니다."),
-        "복합":  ("설계자의 DNA는 있습니다. 다만 AI 앞에서 가끔 주도권을 내어주는 경향이 있습니다. 30초가 성향을 바꿉니다.",
-                  "질문을 보내기 전 딱 한 줄 — '내가 원하는 최종 형태'를 먼저 적어보세요. 그 한 줄이 설계의 시작입니다."),
-        "미형성": ("설계자형과는 아직 거리가 있습니다. 괜찮습니다 — 모든 건축가도 처음엔 벽돌부터 배웠습니다.",
-                   "AI에게 '내 질문이 좋은 질문인지 평가해줘'라고 물어보세요. 자기 질문을 의심하는 순간이 설계자의 출발점입니다."),
+# ── 유형 프로파일(드래프트 · SJ 검토 대상) ────────────────────────────────────
+TYPE_PROFILES = {
+    "설계": {
+        "name": "설계자형",
+        "axis": "질문력↑ · 재구성↑",
+        "one_line": "AI를 도구로 부리는 사람. 질문 전에 목적을 정의하고, 결과를 받으면 재조립한다.",
+        "sections": {
+            "이런 사람입니다": "문제를 정의하는 일 자체에 공을 들인다. 첫 질문이 이미 구체적이고, AI 답을 그대로 쓰기보다 자기 기준으로 다시 짠다.",
+            "가장 빛나는 순간": "복잡한 문제를 잘게 나눠 AI에 맡기고, 돌아온 조각을 엮어 결론을 만들 때. AI를 확장된 작업대처럼 쓴다.",
+            "이 유형의 함정": "모든 걸 직접 설계하려다 속도가 느려질 수 있다. 위임해도 될 일까지 끌어안는다.",
+            "다른 사람 눈에 비치는 당신": "방향이 분명하고 결과물의 완성도가 높은 사람. 다만 가끔 과하게 통제한다는 인상을 줄 수 있다.",
+            "지금 필요한 한 가지": "충분히 좋은 초안은 AI에 더 맡겨보라. 설계와 실행의 균형이 생산성을 키운다.",
+        },
     },
-    "상상가형": {
-        "뚜렷":  ("대화창은 역대급으로 흥미롭고 역대급으로 미완성일 것입니다. 질문은 훌륭합니다 — 문제는 그 훌륭한 질문들이 결론 없이 탭을 닫히고 있다는 것입니다.",
-                  "대화를 시작할 때 첫 줄에 '이 대화의 결과물은 ___이다'를 적어놓고 시작해보세요. 탐색이 착지로 바뀝니다."),
-        "보통":  ("아이디어 생산력은 충분합니다. AI와 나눈 대화 중 절반만 결과물로 만들어도 꽤 생산적인 사람이 됩니다. 지금은 그 절반을 대화 안에 두고 있습니다.",
-                  "오늘 AI와 나눈 대화 중 가장 좋은 아이디어 하나를 골라 50자로 요약해보세요. 요약이 되면 결과물이 됩니다."),
-        "복합":  ("복잡한 질문을 즐기는 기질이 보입니다. 아직 그 즐거움이 실제 재구성으로 연결되지 않는 경우가 있습니다.",
-                  "AI 대화창을 닫기 전에 '내가 오늘 얻은 것 한 가지'를 적는 습관을 만들어보세요. 한 줄이면 충분합니다."),
-        "미형성": ("상상가형과는 거리가 있지만 발전 여지가 큽니다. 질문의 폭을 조금만 넓히면 AI가 생각보다 훨씬 흥미로운 상대임을 곧 발견하게 됩니다.",
-                   "AI에게 '엉뚱한 질문' 하나를 던져보세요. 정답을 찾는 게 아니라 대화를 즐기는 것이 상상가의 출발점입니다."),
+    "상상": {
+        "name": "상상가형",
+        "axis": "질문력↑ · 재구성↓",
+        "one_line": "질문은 풍부하나 착지가 늦은 사람. 아이디어를 펼치는 데 강하다.",
+        "sections": {
+            "이런 사람입니다": "“만약 ~라면”을 즐긴다. 정답보다 탐색이 목적이고, 예상 밖의 연결을 잘 찾는다.",
+            "가장 빛나는 순간": "아무도 묻지 않은 질문을 꺼낼 때. 개념 설계·아이디어 발산에서 특히 강하다.",
+            "이 유형의 함정": "탐색이 즐거운 나머지 결론을 못 맺는다. 좋은 질문이 결과물 없이 쌓일 수 있다.",
+            "다른 사람 눈에 비치는 당신": "시각이 넓고 독창적인 사람. 다만 결과물의 완성도가 들쭉날쭉해 보일 수 있다.",
+            "지금 필요한 한 가지": "대화 시작 전에 “이 대화의 결과물은 ___이다”를 먼저 적어보라. 탐색이 착지로 바뀐다.",
+        },
     },
-    "실행형": {
-        "뚜렷":  ("AI 시대의 장인입니다. 재료를 받으면 곧바로 손이 움직입니다. 입력보다 출력에 강한 유형 — 그 방식이 실제로 잘 작동하고 있습니다.",
-                  "같은 주제로 AI에게 '다른 방식의 답'을 한 번 더 요청해보세요. 비교가 질문 설계를 자연스럽게 가르칩니다."),
-        "보통":  ("AI 결과를 그냥 쓰지 않고 변환하는 감각이 있습니다. '더 좋은 질문을 했더라면 처음부터 덜 고쳤을 텐데' — 그 순간이 다음 단계의 입구입니다.",
-                  "AI 결과를 수정하기 전에 '왜 이 부분이 맞지 않는가'를 한 줄 적어보세요. 수정의 이유가 명확해지면 다음 질문이 달라집니다."),
-        "복합":  ("실행 성향이 있지만 AI 결과를 그대로 수용하는 경우도 혼재합니다. 변환 습관을 의식적으로 강화하면 실행형의 강점이 선명해집니다.",
-                  "AI 결과를 받은 후 한 문장만 내 언어로 바꿔써보세요. 그 한 문장이 재구성의 시작입니다."),
-        "미형성": ("아직 실행형과 거리가 있습니다. AI 결과를 내 상황에 맞게 바꿔보는 시도부터 시작해보세요.",
-                   "AI가 준 답변 중 '내 상황과 다른 부분' 하나를 찾아보세요. 차이를 발견하는 순간 실행형이 시작됩니다."),
+    "실행": {
+        "name": "실행형",
+        "axis": "질문력↓ · 재구성↑",
+        "one_line": "받으면 바로 적용·수정하는 사람. 실행과 변환에 강하다.",
+        "sections": {
+            "이런 사람입니다": "AI 답을 곧장 써보고, 자기 상황에 맞게 고친다. 머무르기보다 움직인다.",
+            "가장 빛나는 순간": "받은 결과를 실제 과제에 즉시 적용하고 다른 도구와 결합해 끝을 볼 때.",
+            "이 유형의 함정": "첫 질문 설계가 약해 엉뚱한 답을 받고도 일단 적용할 수 있다. 방향을 먼저 잡으면 효율이 크게 오른다.",
+            "다른 사람 눈에 비치는 당신": "추진력 있고 결과를 내는 사람. 다만 검토 없이 빨리 간다는 인상을 줄 수 있다.",
+            "지금 필요한 한 가지": "실행 전에 “무엇을 얻으려는가”를 한 줄 적어보라. 같은 속도로 더 정확해진다.",
+        },
     },
-    "의존형": {
-        "뚜렷":  ("AI를 매우 신뢰하는 편입니다 — 어쩌면 지나치게. AI는 훌륭한 조수지만, 당신의 맥락은 당신만 압니다. AI가 모르는 것이 있습니다.",
-                  "AI가 준 답변에 '이건 내 상황과 다르다'고 반응하는 연습을 오늘 딱 한 번만 해보세요. 한 번이면 됩니다."),
-        "보통":  ("AI에 꽤 의존하는 편입니다. 당신만이 아는 맥락을 AI가 놓치고 있는 부분이 반드시 있습니다. 그 부분을 찾는 것이 시작입니다.",
-                  "AI 결과를 붙여넣기 전에 '이게 정말 내가 원하는 말인가'를 3초만 물어보세요. 딱 3초입니다."),
-        "복합":  ("의존 성향이 일부 있지만 다른 유형의 기질도 섞여 있습니다. 작은 습관 하나면 전환됩니다.",
-                  "AI에게 '이 답변의 한계가 뭐야'라고 한 번 물어보세요. AI 스스로 약점을 말해줍니다 — 그때부터 비판적 사용이 시작됩니다."),
-        "미형성": ("의존형 성향이 낮습니다. 이미 어딘가에서 AI를 비판적으로 쓰고 있는 것입니다. 2순위 유형을 확인해보세요.",
-                   "그 비판적 순간을 의식적으로 더 자주 만들어보세요. 이미 하고 있는 것을 더 하면 됩니다."),
+    "의존": {
+        "name": "의존형",
+        "axis": "질문력↓ · 재구성↓",
+        "one_line": "AI 답을 기준 삼아 판단하는 경향. 사고 역량을 키울 여지가 크다.",
+        "sections": {
+            "이런 사람입니다": "AI 답을 대체로 그대로 받아들이고, 마음에 안 들어도 다시 시도하기보다 그냥 쓰는 편이다.",
+            "가장 빛나는 순간": "정형화된 일을 빠르게 처리할 때. AI가 좋은 출발점을 줄 때 효율이 좋다.",
+            "이 유형의 함정": "AI 답의 한계를 스스로 짚지 못하면, 틀린 전제 위에서 일이 진행될 수 있다.",
+            "다른 사람 눈에 비치는 당신": "AI를 적극 활용하는 사람. 다만 결과를 검증한다는 신뢰는 아직 덜 줄 수 있다.",
+            "지금 필요한 한 가지": "AI 답을 받으면 “이 답이 틀렸다면 어디일까?”를 한 번만 물어보라. 작은 의심이 큰 차이를 만든다.",
+        },
     },
 }
+TYPE_ORDER = ["설계", "상상", "실행", "의존"]  # 2x2 표시 순서
 
-def get_type_level(score: int) -> str:
-    """유형 점수(5~20) → 수준 반환"""
-    if score >= 17: return "뚜렷"
-    elif score >= 13: return "보통"
-    elif score >= 9:  return "복합"
-    else:             return "미형성"
+# ── 채점 앵커(프롬프트에 그대로 삽입, 구현 §1.2·1.3) ──────────────────────────
+SCORING_PROMPT_HEAD = """당신은 심리측정 채점 전문가다. 아래는 한 사용자가 AI와 일상 주제를 논의한 대화 전문이다.
+사용자의 발화만 근거로 7개 세부지표를 각각 1~10 정수로 채점한다.
+대화 내용의 '옳고 그름'이나 '지식 수준'은 평가하지 않는다. 사고의 구조만 본다.
 
-# 12개 조합 (1순위 × 2순위) — 캐릭터명 + 위트 한 줄
-TYPE_COMBOS = {
-    ("설계자형", "상상가형"): ("전략가",      "큰 그림을 그리고 새 프레임을 만든다"),
-    ("설계자형", "실행형"):   ("지휘관",      "설계하고 직접 전장에서 실행한다"),
-    ("설계자형", "의존형"):   ("기획가",      "설계는 내가, 실행은 맡긴다"),
-    ("상상가형", "설계자형"): ("탐험가",      "아이디어가 넘치고 가끔 착지도 한다"),
-    ("상상가형", "실행형"):   ("몽상 실행가",  "엉뚱한 아이디어를 일단 만들어본다"),
-    ("상상가형", "의존형"):   ("브레인스토머", "아이디어는 AI와 함께, 마무리는 내일"),
-    ("실행형",   "설계자형"): ("장인",        "만들면서 설계를 배운다"),
-    ("실행형",   "상상가형"): ("실험가",      "일단 만들고 엉뚱한 방향으로 튼다"),
-    ("실행형",   "의존형"):   ("스프린터",    "빠르게 받고 빠르게 쓴다"),
-    ("의존형",   "설계자형"): ("견습생",      "AI를 믿지만 설계 본능이 깨어나는 중"),
-    ("의존형",   "상상가형"): ("구경꾼",      "AI가 신기하고 재밌는데 아직 주도권이 없다"),
-    ("의존형",   "실행형"):   ("복사기",      "받아서 바로 쓰는데 나름 손은 빠르다"),
-}
+[QLI — '[개시구간]'만 본다] (각 1~10)
+1 목적정향성: 1-2 막연 / 3-4 주제만 / 5-6 산출형태 일부 / 7-8 산출형태+맥락 / 9-10 산출·관점·기준 규정
+2 맥락구조화: 1-2 없음 / 3-4 1요소 / 5-6 2요소 / 7-8 3요소+ / 9-10 제약·예외·우선순위까지
+3 인지부하설계: 1-2 단순사실 / 3-4 단일설명 / 5-6 한단계추론 / 7-8 비교·인과·조건부 / 9-10 시나리오·반사실·트레이드오프
+4 주도성: 1-2 완전위임 / 3-4 대체로위임 / 5-6 절반 / 7-8 사용자가틀+부분위임 / 9-10 전체설계
 
-# ─────────────────────────────────────────────
-# 점수 매트릭스 (선택값 → 점수)
-# ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
-# 2단계 — AI 열린 대화 설정 (v10.0)
-# ─────────────────────────────────────────────
-DIALOGUE_TOPIC = "AI 시대의 미래에 일어날 경제적 양극화 문제"
-MAX_USER_TURNS = 7   # 사용자 발화 상한
-MIN_TURNS_TO_FINISH = 2  # 종료 버튼 활성화 최소 사용자 발화 수
+[MTI — '[전환구간]'만 본다] (각 1~10)
+5 프레임전환: 1-2 무시/반복 / 3-4 방어 / 5-6 일부조정 / 7-8 전제 재검토 / 9-10 틀 자체 재설정
+6 심화전환: 1-2 수용 / 3-4 표면질문 / 5-6 근거요구 / 7-8 허점·전제 지목 / 9-10 반례·조건으로 압박
+7 통합전환: 1-2 단발 / 3-4 약한참조 / 5-6 연결시도 / 7-8 엮어 새관점 / 9-10 통합해 상위 질문
+- '[전환구간]'의 사용자 발화가 2개 미만이면 MTI를 채점하지 말고 mti_status="undetermined".
 
-DIALOGUE_SYSTEM_PROMPT = f"""당신은 '{DIALOGUE_TOPIC}'를 함께 논의하는 토론 파트너다.
-규칙:
-- 한국어로, 3~5문장으로 답한다.
-- 사용자의 질문에 충실히 답하되, 매 답변에 사용자가 미처 생각하지 못했을 관점이나 정보를 정확히 1개 포함한다.
-- 단정하지 말고 근거와 함께 관점을 제시한다.
-- 사용자에게 되묻지 않는다. 답변만 한다."""
+[transition_turn] 도전 질문 직후 사용자 발화를 1로 세어, 프레임 또는 심화 전환이 처음 나타난 발화 번호. 없으면 0.
 
-SCORING_PROMPT = """당신은 심리측정 전문가다. 아래는 한 사용자가 AI와 '{topic}'를 논의한 대화 전문이다.
-사용자의 발화만을 근거로 두 지표를 1~10 정수로 채점하라.
+[few-shot 앵커 — 주제 '이사']
+A(高): 개시 "재택2·출근3 기준 통근1h↑ vs 월40만원 절약, 3년 누적 비교해줘. 단 아이 학교는 외곽이 좋아" / 도전후 "통근을 손실로만 봤네, 전제를 다시 잡아야겠다" → purpose8 context9 load8 initiative8 frame8 deepen7 integrate7 tt1
+B(中): 개시 "도심·외곽 이사 어디가 나아? 장단점 정리해줘" / 도전후 "그럼 외곽 단점 더 알려줘" → purpose5 context3 load4 initiative4 frame4 deepen5 integrate4 tt0
+C(低/보류): 개시 "이사 어디로 갈까?" / 도전후 발화없음 → purpose2 context1 load1 initiative1 mti_status="undetermined" tt0
 
-[QLI — 질문 구성력] 사용자의 첫 질문(필요시 1~2번째 발화)을 다음 4개 지표로 평가해 종합:
-1. 목적 정향성: 무엇을 얻으려는지 명시했는가 (막연한 질문=低, 원하는 산출·관점 규정=高)
-2. 맥락 구조화: 시점·범위·대상·조건을 제공했는가
-3. 인지적 부하 설계: AI에게 비교·인과·시나리오 등 구조적 사고를 요구했는가 (단순 정보 요구=低)
-4. 주도성: 대화 방향을 사용자가 설계하는가, AI에 판단을 위임하는가
-
-[MTI — 메타인지 전환] 2번째 발화부터, AI 응답이 사용자의 사고를 움직였는가:
-- 프레임 전환: AI 답을 받아 질문의 전제·관점 자체를 재설정
-- 심화 전환: AI 답의 허점·전제를 파고들어 구체화
-- 통합 전환: 이전 답들을 엮어 새로운 질문 구성
-- 전환이 빠를수록(적은 턴), 깊을수록 높게. 같은 수준 반복·재진술만 있으면 1~3.
-- 사용자 발화가 1개뿐이면 MTI=3 (전환 기회 자체가 관측되지 않음).
-
-반드시 아래 JSON만 출력하라. 다른 텍스트 금지.
-{{"qli": <1-10 정수>, "mti": <1-10 정수>, "transition_turn": <전환이 처음 나타난 사용자 발화 번호, 없으면 0>, "comment": "<채점 근거 한두 문장, 행동 기반 언어>"}}
+아래 JSON만 출력한다. 다른 텍스트 금지.
+{"purpose":N,"context":N,"load":N,"initiative":N,"frame":N,"deepen":N,"integrate":N,"mti_status":"scored 또는 undetermined","transition_turn":N,"comment":"채점 근거 1~2문장(행동 인용)"}
 
 [대화 전문]
-{transcript}
+"""
+
+PARTNER_SYSTEM = """당신은 '{dilemma}'를 함께 고민하는 토론 파트너다.
+- 한국어로 3~5문장으로 답한다.
+- 사용자의 말에 충실히 답하되, 매 답변에 사용자가 미처 보지 못한 관점·정보를 정확히 1개 더한다.
+- 단정하지 말고 근거와 함께 제시한다.
+- 사용자에게 되묻지 않는다. 답변만 한다."""
+
+PERTURB_PROMPT = """아래 대화에서 사용자가 지금까지 당연하게 전제한 가정 1개를 식별하라.
+그 전제가 사실이 아닐 수 있음을 한 문장 질문으로 제시하라.
+형식: "지금까지 ___를 당연한 전제로 두신 것 같은데, 만약 그렇지 않다면 어떻게 달라질까요?"
+새로운 정보·조언을 주지 말 것. 전제는 정확히 1개만 건드릴 것. 질문 한 문장만 출력.
+
+[대화]
 """
 
 
-def generate_ai_reply(dialogue: list) -> str:
-    """대화 이력 기반 AI 응답 생성. 실패 시 안내 문구."""
+# ──────────────────────────────────────────────────────────────────────────────
+# 외부 연결 헬퍼
+# ──────────────────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_openai_client():
+    from openai import OpenAI
+    return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+
+def openai_model():
+    return st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
+
+
+@st.cache_resource(show_spinner=False)
+def get_spreadsheet():
+    import gspread
+    from google.oauth2.service_account import Credentials
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=scopes
+    )
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(st.secrets["SHEET_ID"])
+
+
+def get_ws(name, header=None):
+    """워크시트 가져오기(없으면 생성). header 주면 1행에 보장."""
+    sh = get_spreadsheet()
     try:
-        msgs = [{"role": "system", "content": DIALOGUE_SYSTEM_PROMPT}]
-        msgs += [{"role": m["role"], "content": m["content"]} for m in dialogue]
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini", messages=msgs,
-            max_tokens=500, temperature=0.7,
-        )
-        return resp.choices[0].message.content.strip()
+        ws = sh.worksheet(name)
     except Exception:
-        return "(AI 응답 생성에 실패했습니다. 계속 질문을 이어가거나 논의를 마쳐주세요.)"
+        ws = sh.add_worksheet(title=name, rows=1000, cols=60)
+        if header:
+            ws.append_row(header)
+        return ws
+    if header:
+        first = ws.row_values(1)
+        if not first:
+            ws.append_row(header)
+    return ws
 
 
-def score_dialogue(dialogue: list) -> tuple:
-    """
-    대화 종료 후 일괄 채점. 반환: (qli, mti, transition_turn, comment)
-    실패 시 (5, 5, 0, "") — 중립값 폴백.
-    """
-    lines, uturn = [], 0
-    for m in dialogue:
-        if m["role"] == "user":
-            uturn += 1
-            lines.append(f"[사용자 발화 {uturn}] {m['content']}")
+def now_kst():
+    return datetime.now(KST)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 인증 (사번 + 이메일 6자리 코드)
+# ──────────────────────────────────────────────────────────────────────────────
+def send_email_code(to_email, code):
+    sender = st.secrets["EMAIL_ADDRESS"]
+    pw = st.secrets["EMAIL_APP_PW"]
+    body = f"AIQ 진단 본인확인 코드: {code}\n유효시간 {CODE_TTL_MIN}분.\n본 메일을 요청하지 않았다면 무시하세요."
+    msg = MIMEText(body, _charset="utf-8")
+    msg["Subject"] = "[AIQ] 본인확인 코드"
+    msg["From"] = formataddr(("AIQ 진단", sender))
+    msg["To"] = to_email
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as s:
+        s.starttls()
+        s.login(sender, pw)
+        s.sendmail(sender, [to_email], msg.as_string())
+
+
+def render_auth():
+    st.subheader("본인 확인")
+    st.caption("사번(10자리)과 이메일을 입력하면 6자리 코드를 메일로 보냅니다. 스팸함도 확인해 주세요.")
+    st.caption("ℹ️ 입력하신 이메일은 **결과 발송을 위해 수집·보관**되며, 진단 결과 안내 외 용도로 사용하지 않습니다.")
+    ss = st.session_state
+    emp_id = st.text_input(f"사번 (숫자 {EMP_ID_LEN}자리)", value=ss.get("emp_id", ""), max_chars=EMP_ID_LEN)
+    email = st.text_input("이메일", value=ss.get("email", ""))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("인증 코드 보내기", use_container_width=True):
+            if not (emp_id.isdigit() and len(emp_id) == EMP_ID_LEN):
+                st.error(f"사번은 숫자 {EMP_ID_LEN}자리여야 합니다.")
+            elif "@" not in email or "." not in email:
+                st.error("이메일 형식을 확인하세요.")
+            else:
+                last = ss.get("code_sent_at")
+                if last and (now_kst() - last).total_seconds() < CODE_COOLDOWN_SEC:
+                    wait = int(CODE_COOLDOWN_SEC - (now_kst() - last).total_seconds())
+                    st.warning(f"재발송은 {wait}초 후 가능합니다.")
+                else:
+                    code = f"{pysecrets.randbelow(10**6):06d}"
+                    try:
+                        send_email_code(email, code)
+                        ss.emp_id, ss.email = emp_id, email
+                        ss.code = code
+                        ss.code_expires = now_kst() + timedelta(minutes=CODE_TTL_MIN)
+                        ss.code_attempts = 0
+                        ss.code_sent_at = now_kst()
+                        ss.code_sent = True
+                        st.success("코드를 보냈습니다. 메일함(및 스팸함)을 확인하세요.")
+                    except Exception as e:
+                        st.error(f"메일 발송 실패: {e}")
+
+    if ss.get("code_sent"):
+        code_in = st.text_input("받은 6자리 코드", max_chars=6)
+        with c2:
+            if st.button("확인", use_container_width=True):
+                if ss.get("code_attempts", 0) >= CODE_MAX_ATTEMPTS:
+                    st.error("실패 횟수를 초과했습니다. 코드를 다시 받아주세요.")
+                elif now_kst() > ss.get("code_expires", now_kst()):
+                    st.error("코드가 만료되었습니다. 다시 받아주세요.")
+                elif code_in.strip() == ss.get("code"):
+                    ss.verified = True
+                    ss.serial = "AIQ_" + now_kst().strftime("%m%d_%H%M%S")
+                    ss.order = ["l1", "l3"] if random.random() < 0.5 else ["l3", "l1"]
+                    ss.step = 0
+                    ss.topic_id = random.choice(list(TOPICS.keys()))
+                    ss.stage = "flow"
+                    st.success("본인 확인 완료.")
+                    st.rerun()
+                else:
+                    ss.code_attempts = ss.get("code_attempts", 0) + 1
+                    left = CODE_MAX_ATTEMPTS - ss.code_attempts
+                    st.error(f"코드가 일치하지 않습니다. (남은 시도 {left}회)")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# L1 설문 + 채점
+# ──────────────────────────────────────────────────────────────────────────────
+def render_l1():
+    st.subheader("1단계 · 스스로 답하기")
+    st.caption("지난 1주간 AI를 사용하면서 다음 행동을 얼마나 했습니까? 정답은 없습니다 — 평소 모습 그대로 답하세요.")
+    ss = st.session_state
+    resp = ss.get("l1_resp", {})
+    with st.form("l1_form"):
+        for it in L1_ITEMS:
+            resp[it["code"]] = st.radio(
+                it["text"],
+                options=[1, 2, 3, 4],
+                format_func=lambda v: f"{v} · {L1_SCALE[v]}",
+                horizontal=True,
+                index=None,  # 기본 선택 없음(묵종·중앙 편향 방지)
+                key="l1_" + it["code"],
+            )
+        st.markdown("---")
+        st.caption("AI에 대한 생각")
+        for it in L2_ITEMS:
+            resp[it["code"]] = st.radio(
+                it["text"],
+                options=[1, 2, 3, 4],
+                format_func=lambda v: f"{v} · {L2_SCALE[v]}",
+                horizontal=True,
+                index=None,
+                key="l2_" + it["code"],
+            )
+        submitted = st.form_submit_button("다음", use_container_width=True)
+    if submitted:
+        missing = [it["code"] for it in (L1_ITEMS + L2_ITEMS) if resp.get(it["code"]) is None]
+        if missing:
+            st.error(f"모든 문항에 답해 주세요. (미응답 {len(missing)}개)")
         else:
-            lines.append(f"[AI 응답] {m['content']}")
-    transcript = "\n".join(lines)
-    prompt = SCORING_PROMPT.format(topic=DIALOGUE_TOPIC, transcript=transcript)
+            ss.l1_resp = resp
+            ss.l1_result = score_l1(resp)
+            ss.step += 1
+            st.rerun()
+
+
+def score_l1(resp):
+    def val(item):
+        v = resp.get(item["code"], 0)
+        return (5 - v) if item["key"] == "R" else v
+
+    sums = {t: 0 for t in TYPE_ORDER}
+    for it in L1_ITEMS:
+        if it["type"] in sums:
+            sums[it["type"]] += val(it)
+
+    ranked = sorted(TYPE_ORDER, key=lambda t: sums[t], reverse=True)
+    t1, t2 = ranked[0], ranked[1]
+    s1 = sums[t1]
+
+    if s1 >= 17:
+        level = "뚜렷"
+    elif s1 >= 13:
+        level = "보통"
+    elif s1 >= 9:
+        level = "복합"
+    else:
+        level = "미형성"
+
+    # 표시 규칙(§3.5)
+    if level == "미형성":
+        display = "경향 약함 — 아직 뚜렷한 패턴이 나타나지 않았습니다."
+        primary = None
+    elif (s1 - sums[t2]) < TYPE_GAP_T:
+        display = f"복합 (혼합 경향) — {TYPE_PROFILES[t1]['name']} · {TYPE_PROFILES[t2]['name']}"
+        primary = t1
+    else:
+        display = f"{TYPE_PROFILES[t1]['name']} · {level} (1순위) / {TYPE_PROFILES[t2]['name']} (2순위)"
+        primary = t1
+
+    # 일관성/직선 플래그
+    consistency = (
+        abs(resp.get("D1", 0) - resp.get("CK1", 0)) >= 2
+        or abs(resp.get("P1", 0) - resp.get("CK2", 0)) >= 2
+    )
+    answered = [resp.get(it["code"]) for it in L1_ITEMS]
+    straightline = len(set(answered)) == 1
+
+    eff = 0
+    for it in L2_ITEMS:
+        v = resp.get(it["code"], 0)
+        eff += (5 - v) if it["key"] == "R" else v
+
+    # 불일치용 좌표(§5.4)
+    qli_tend = (sums["설계"] + sums["상상"]) - (sums["실행"] + sums["의존"])
+    recon_tend = (sums["설계"] + sums["실행"]) - (sums["상상"] + sums["의존"])
+
+    return {
+        "sums": sums, "type1": t1, "type2": t2, "level1": level,
+        "type_display": display, "primary": primary,
+        "consistency_flag": consistency, "straightline_flag": straightline,
+        "efficacy_score": eff, "L1_QLI성향": qli_tend, "L1_재구성성향": recon_tend,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# L3 대화 + 표준 도전 질문
+# ──────────────────────────────────────────────────────────────────────────────
+def ai_reply(messages, dilemma):
+    client = get_openai_client()
+    sys = PARTNER_SYSTEM.format(dilemma=dilemma)
+    chat = [{"role": "system", "content": sys}] + messages
+    r = client.chat.completions.create(model=openai_model(), messages=chat, temperature=PARTNER_TEMP)
+    return r.choices[0].message.content.strip()
+
+
+def make_perturbation(messages):
+    client = get_openai_client()
+    convo = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+    r = client.chat.completions.create(
+        model=openai_model(),
+        messages=[{"role": "user", "content": PERTURB_PROMPT + convo}],
+        temperature=SCORING_TEMP,
+    )
+    return r.choices[0].message.content.strip()
+
+
+def render_l3():
+    ss = st.session_state
+    topic = TOPICS[ss.topic_id]
+    st.subheader("2단계 · AI와 대화하기")
+    st.info(f"**논의 주제 · {topic['title']}**\n\n{topic['dilemma']}에 대해 논의합니다. AI에게 가장 먼저 어떤 질문을 하시겠습니까?")
+    st.caption(f"대화는 최대 {MAX_USER_TURNS}번까지 이어갈 수 있고, 충분하다고 느끼면 마칠 수 있습니다.")
+
+    if "l3_msgs" not in ss:
+        ss.l3_msgs = []           # [{role, content}]  (AI 도전 질문은 role=assistant, challenge=True)
+        ss.l3_user_turns = 0
+        ss.l3_perturbed = False
+        ss.l3_perturb_user_index = None  # 도전 직전까지의 사용자 발화 수
+        # AI 인트로 1회
+        ss.l3_msgs.append({"role": "assistant", "content": topic["intro"], "challenge": False})
+
+    # 렌더(시간순, 입력창은 항상 하단)
+    for m in ss.l3_msgs:
+        with st.chat_message("assistant" if m["role"] == "assistant" else "user"):
+            if m.get("challenge"):
+                st.markdown(f"🔆 **(생각해볼 질문)** {m['content']}")
+            else:
+                st.markdown(m["content"])
+
+    done_col = st.container()
+    user_text = st.chat_input("메시지를 입력하세요" if ss.l3_user_turns < MAX_USER_TURNS else "최대 턴에 도달했습니다")
+
+    if user_text and ss.l3_user_turns < MAX_USER_TURNS:
+        ss.l3_msgs.append({"role": "user", "content": user_text, "challenge": False})
+        ss.l3_user_turns += 1
+        api_msgs = [{"role": m["role"], "content": m["content"]} for m in ss.l3_msgs]
+
+        # 2번째 사용자 발화 직후 → 표준 도전 질문 1회
+        if (not ss.l3_perturbed) and ss.l3_user_turns == PERTURB_AFTER:
+            try:
+                q = make_perturbation(api_msgs)
+            except Exception:
+                q = "지금까지 한 가지를 당연한 전제로 두신 것 같은데, 만약 그렇지 않다면 판단이 달라질까요?"
+            ss.l3_msgs.append({"role": "assistant", "content": q, "challenge": True})
+            ss.l3_perturbed = True
+            ss.l3_perturb_user_index = ss.l3_user_turns
+            ss.perturbation_text = q
+        else:
+            try:
+                a = ai_reply(api_msgs, topic["dilemma"])
+            except Exception as e:
+                a = f"(응답 생성 오류: {e})"
+            ss.l3_msgs.append({"role": "assistant", "content": a, "challenge": False})
+        st.rerun()
+
+    # 종료 버튼(발화 2회 이상부터)
+    with done_col:
+        if ss.l3_user_turns >= 2:
+            if st.button("논의 마치고 다음으로 →", use_container_width=True, type="primary"):
+                ss.l3_done = True
+                ss.step += 1
+                st.rerun()
+
+
+def build_segments():
+    """[개시구간]/[전환구간]/[AI]/[AI·도전] 태깅 전문 + 전환구간 사용자 발화 수."""
+    ss = st.session_state
+    lines, seg = [], "개시"
+    post_user = 0
+    for m in ss.l3_msgs:
+        if m["role"] == "user":
+            tag = "[개시구간]" if seg == "개시" else "[전환구간]"
+            lines.append(f"{tag} 사용자: {m['content']}")
+            if seg == "전환":
+                post_user += 1
+        else:
+            if m.get("challenge"):
+                lines.append(f"[AI·도전] {m['content']}")
+                seg = "전환"
+            else:
+                lines.append(f"[AI] {m['content']}")
+    return "\n".join(lines), post_user
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 채점 (k=3 · 중앙값 · 판단보류)
+# ──────────────────────────────────────────────────────────────────────────────
+def _parse_score(text):
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        t = t[t.find("{"):]
+    return json.loads(t[t.find("{"): t.rfind("}") + 1])
+
+
+def score_dialogue(transcript, post_user_turns):
+    client = get_openai_client()
+    passes = []
+    for _ in range(K_PASSES):
+        try:
+            r = client.chat.completions.create(
+                model=openai_model(),
+                messages=[{"role": "user", "content": SCORING_PROMPT_HEAD + transcript}],
+                temperature=SCORING_TEMP,
+            )
+            passes.append(_parse_score(r.choices[0].message.content))
+        except Exception:
+            continue
+
+    if len(passes) < 2:
+        return {"aiq_raw": None, "mti_status": "error", "valid": False,
+                "reason": "채점 실패", "qli_mean": None, "mti_mean": None,
+                "transition_turn": 0, "comment": "", "pass_var_qli": None, "pass_var_mti": None,
+                "qli": {}, "mti": {}, "passes": passes}
+
+    def med(key):
+        return statistics.median([p[key] for p in passes if key in p])
+
+    qli_keys = ["purpose", "context", "load", "initiative"]
+    mti_keys = ["frame", "deepen", "integrate"]
+    qli = {k: med(k) for k in qli_keys}
+    qli_mean = round(sum(qli.values()) / 4, 2)
+
+    undetermined = (post_user_turns < 2) or any(p.get("mti_status") == "undetermined" for p in passes)
+    if undetermined:
+        return {"aiq_raw": None, "mti_status": "undetermined", "valid": False,
+                "reason": "행동 변화 미관측(전환구간 발화 부족)",
+                "qli_mean": qli_mean, "mti_mean": None,
+                "transition_turn": int(med("transition_turn")) if any("transition_turn" in p for p in passes) else 0,
+                "comment": passes[0].get("comment", ""),
+                "pass_var_qli": round(statistics.pvariance([p["purpose"] for p in passes]), 2) if len(passes) > 1 else 0,
+                "pass_var_mti": None, "qli": qli, "mti": {}, "passes": passes}
+
+    mti = {k: med(k) for k in mti_keys}
+    mti_mean = round(sum(mti.values()) / 3, 2)
+    aiq_raw = max(0, min(200, round(100 + (qli_mean + mti_mean - 10) * 5)))
+    return {
+        "aiq_raw": aiq_raw, "mti_status": "scored", "valid": True, "reason": "",
+        "qli_mean": qli_mean, "mti_mean": mti_mean,
+        "transition_turn": int(med("transition_turn")),
+        "comment": passes[0].get("comment", ""),
+        "pass_var_qli": round(statistics.pvariance([sum(p[k] for k in qli_keys) / 4 for p in passes]), 2),
+        "pass_var_mti": round(statistics.pvariance([sum(p[k] for k in mti_keys) / 3 for p in passes]), 2),
+        "qli": qli, "mti": mti, "passes": passes,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 저장 (responses + id_map 분리) · 유효성 판정
+# ──────────────────────────────────────────────────────────────────────────────
+RESP_HEADER = [
+    "serial", "ts_kst", "verified", "order_mode", "topic_id",
+    "type_설계", "type_상상", "type_실행", "type_의존",
+    "type1", "type2", "level1", "type_display",
+    "consistency_flag", "straightline_flag", "efficacy_score",
+    "qli_purpose", "qli_context", "qli_load", "qli_initiative", "qli_mean",
+    "mti_frame", "mti_deepen", "mti_integrate", "mti_mean", "mti_status",
+    "transition_turn", "pass_var_qli", "pass_var_mti", "aiq_raw", "comment",
+    "L1_QLI성향", "L1_재구성성향", "transcript", "perturbation_text",
+    "valid_flag", "invalid_reason", "aiq_pct", "pct_label", "result_sent",
+]
+IDMAP_HEADER = ["serial", "emp_id", "email", "ts_kst"]
+
+
+def save_response(transcript, sc, pct="", label="", result_sent=""):
+    ss = st.session_state
+    l1 = ss.l1_result
+
+    # 유효성 판정(§5.3)
+    invalid = []
+    if not ss.get("verified"):
+        invalid.append("미인증")
+    if l1["straightline_flag"]:
+        invalid.append("직선응답")
+    if l1["consistency_flag"]:
+        invalid.append("일관성의심")
+    if ss.get("l3_user_turns", 0) < 2:
+        invalid.append("발화부족")
+    if sc["mti_status"] != "scored":
+        invalid.append("전환력보류" if sc["mti_status"] == "undetermined" else "채점실패")
+    valid = "유효" if not invalid else "무효"
+
+    q = sc.get("qli", {})
+    m = sc.get("mti", {})
+    row = [
+        ss.serial, now_kst().strftime("%Y-%m-%d %H:%M:%S"), True, "/".join(ss.order), ss.topic_id,
+        l1["sums"]["설계"], l1["sums"]["상상"], l1["sums"]["실행"], l1["sums"]["의존"],
+        l1["type1"], l1["type2"], l1["level1"], l1["type_display"],
+        l1["consistency_flag"], l1["straightline_flag"], l1["efficacy_score"],
+        q.get("purpose"), q.get("context"), q.get("load"), q.get("initiative"), sc.get("qli_mean"),
+        m.get("frame"), m.get("deepen"), m.get("integrate"), sc.get("mti_mean"), sc.get("mti_status"),
+        sc.get("transition_turn"), sc.get("pass_var_qli"), sc.get("pass_var_mti"),
+        sc.get("aiq_raw"), sc.get("comment"),
+        l1["L1_QLI성향"], l1["L1_재구성성향"], transcript, ss.get("perturbation_text", ""),
+        valid, ";".join(invalid), pct, label, result_sent,
+    ]
+    get_ws(RESP_WS, RESP_HEADER).append_row(row, value_input_option="USER_ENTERED")
+    get_ws(IDMAP_WS, IDMAP_HEADER).append_row(
+        [ss.serial, ss.emp_id, ss.email, now_kst().strftime("%Y-%m-%d %H:%M:%S")]
+    )
+    return valid
+
+
+def valid_count():
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=300, temperature=0.0,
-        )
-        raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r"```(json)?|```", "", raw).strip()
-        import json as _json
-        data = _json.loads(raw)
-        qli = max(1, min(10, int(data.get("qli", 5))))
-        mti = max(1, min(10, int(data.get("mti", 5))))
-        tt  = max(0, int(data.get("transition_turn", 0)))
-        cm  = str(data.get("comment", ""))[:300]
-        return qli, mti, tt, cm
+        ws = get_ws(RESP_WS, RESP_HEADER)
+        col = ws.col_values(RESP_HEADER.index("valid_flag") + 1)[1:]
+        return sum(1 for v in col if v == "유효")
     except Exception:
-        return 5, 5, 0, ""
+        return 0
 
-def compute_aiq(qli: int, mti: int) -> int:
-    """AIQ 지수 산출 — 100 기준, 범위 약 70~150"""
-    return max(0, min(200, 100 + (qli + mti - 10) * 5))
 
-# ─────────────────────────────────────────────
-# 유형 산출
-# ─────────────────────────────────────────────
-def compute_type_scores(answers: dict, questions: list) -> dict:
-    scores = {"설계자": 0, "상상가": 0, "실행": 0, "의존": 0}
-    for (no, text, typ, reverse) in questions:
-        val = answers.get(no, 2)
-        if reverse:
-            val = 5 - val
-        scores[typ] += val
-    return scores
-
-def compute_top_types(type_scores: dict) -> tuple:
-    sorted_types = sorted(type_scores.items(), key=lambda x: x[1], reverse=True)
-    return TYPE_LABELS[sorted_types[0][0]], TYPE_LABELS[sorted_types[1][0]]
-
-def validate_name(name: str) -> bool:
-    if not name or not name.strip():
-        return False
-    return bool(re.match(r"^[가-힣A-Za-z\s]{2,20}$", name.strip()))
-
-def validate_birth(birth: str) -> bool:
-    if not birth or len(birth) != 8 or not birth.isdigit():
-        return False
+# ──────────────────────────────────────────────────────────────────────────────
+# 정규화 (유효 200 자동·1회 잠금) — 점수는 이후 단계에서만 표시
+# ──────────────────────────────────────────────────────────────────────────────
+def norm_locked():
     try:
-        d = datetime.strptime(birth, "%Y%m%d")
-        return 1900 <= d.year <= datetime.now().year
-    except ValueError:
-        return False
+        ws = get_ws(META_WS, ["key", "value"])
+        for r in ws.get_all_values()[1:]:
+            if r and r[0] == "norm_locked":
+                return r[1] == "1"
+    except Exception:
+        pass
+    return False
 
-# ─────────────────────────────────────────────
-# 유형 보고서 콘텐츠 — GitHub MD 동적 호출
-# ─────────────────────────────────────────────
-CONTENT_URL = (
-    "https://raw.githubusercontent.com/Nextep-K/sobaekhyeon-crp/main/aiq_content_v1.md"
-)
 
-@st.cache_data(ttl=3600)
-def load_content() -> dict:
-    """
-    GitHub raw URL에서 MD 파일을 로드하고 파싱하여 반환한다.
-    반환값: {(type1, type2): {"name","tagline","quote","quote_attr",
-                              "intro","strength","trap","perception","advice"}}
-    실패 시 빈 dict — 코드 내 TYPE_COMBOS/TYPE_DESC가 fallback으로 작동.
-    """
+def maybe_normalize():
+    """유효 200 도달 시 1회만: 분포→백분위 일괄 기입(batch)→잠금."""
+    if norm_locked() or valid_count() < NORM_THRESHOLD:
+        return
+    from gspread.utils import rowcol_to_a1
+
+    ws = get_ws(RESP_WS, RESP_HEADER)
+    rows = ws.get_all_values()
+    header, data = rows[0], rows[1:]
+    if not data:
+        return
+    i_valid = header.index("valid_flag")
+    i_raw = header.index("aiq_raw")
+    i_pct = header.index("aiq_pct")
+    i_lbl = header.index("pct_label")
+
+    raws = [float(r[i_raw]) for r in data
+            if len(r) > i_raw and r[i_valid] == "유효" and r[i_raw] not in ("", None)]
+    if not raws:
+        return
+    raws_sorted = sorted(raws)
+    n = len(raws_sorted)
+
+    # 행 순서대로 백분위/문구 열 값 구성(무효 행은 공백 유지)
+    pct_col, lbl_col = [], []
+    for r in data:
+        if len(r) > i_raw and r[i_valid] == "유효" and r[i_raw] not in ("", None):
+            v = float(r[i_raw])
+            le = sum(1 for x in raws_sorted if x <= v)
+            pct = round(le / n * 100)
+            top = max(1, round((100 - pct) / 10) * 10)  # 상위 N%(10%p 반올림)
+            pct_col.append([pct])
+            lbl_col.append([f"상위 약 {top}% 안에 포함됩니다"])
+        else:
+            pct_col.append([""])
+            lbl_col.append([""])
+
+    last_row = 1 + len(data)  # 데이터는 시트 2행부터
+    rng_pct = f"{rowcol_to_a1(2, i_pct + 1)}:{rowcol_to_a1(last_row, i_pct + 1)}"
+    rng_lbl = f"{rowcol_to_a1(2, i_lbl + 1)}:{rowcol_to_a1(last_row, i_lbl + 1)}"
+
+    # 단일 batch 요청(호출 1~2회)
+    ws.batch_update(
+        [{"range": rng_pct, "values": pct_col},
+         {"range": rng_lbl, "values": lbl_col}],
+        value_input_option="USER_ENTERED",
+    )
+
+    mws = get_ws(META_WS, ["key", "value"])
+    mws.append_row(["norm_locked", "1"])
+    mws.append_row(["norm_n", str(n)])
+    mws.append_row(["norm_dist", json.dumps(raws_sorted)])  # 운영모드 백분위 산출 기준
+    mws.append_row(["norm_ts", now_kst().strftime("%Y-%m-%d %H:%M:%S")])
+
+
+# ── 운영 모드(잠금 후): 임의 raw → 백분위 ───────────────────────────────────────
+def get_meta_dict():
     try:
-        r = requests.get(CONTENT_URL, timeout=5)
-        if r.status_code != 200:
-            return {}
-        return parse_content(r.text)
+        ws = get_ws(META_WS, ["key", "value"])
+        return {r[0]: r[1] for r in ws.get_all_values()[1:] if len(r) >= 2}
     except Exception:
         return {}
 
 
-def parse_content(md: str) -> dict:
-    """
-    MD 파일 텍스트 → {(type1, type2): sections_dict}
-
-    섹션 헤더 형식: ## 01. 지휘관 · 설계자형 + 실행형
-    섹션 블록 형식: **이런 사람입니다** (줄 시작)
-    """
-    result = {}
-    # 각 유형 블록을 ## 헤더로 분리
-    blocks = re.split(r"\n## \d+\.", md)
-    for block in blocks[1:]:  # 첫 번째는 파일 헤더
-        lines = block.strip().split("\n")
-        header = lines[0].strip()  # "지휘관 · 설계자형 + 실행형"
-
-        # 캐릭터명 + 유형 조합 파싱
-        m = re.match(r"(.+?)\s*·\s*(\S+형)\s*\+\s*(\S+형)", header)
-        if not m:
-            continue
-        char_name = m.group(1).strip()
-        type1     = m.group(2).strip()
-        type2     = m.group(3).strip()
-
-        body = "\n".join(lines[1:])
-
-        # 위트(tagline) — 첫 번째 > ** 블록
-        tagline_m = re.search(r'>\s*\*\*"(.+?)"\*\*', body)
-        tagline   = tagline_m.group(1) if tagline_m else ""
-
-        # 명언 — 두 번째 > * 블록
-        quote_m   = re.search(r'>\s*\*"(.+?)"\*', body)
-        quote     = quote_m.group(1) if quote_m else ""
-        # 명언 출처
-        quote_attr_m = re.search(r'—\s*(.+?)$', quote, re.M) if quote else None
-        if "—" in quote:
-            parts      = quote.split("—", 1)
-            quote      = parts[0].strip()
-            quote_attr = "— " + parts[1].strip()
-        else:
-            quote_attr = ""
-
-        def extract_section(label: str) -> str:
-            """**label** 이후 다음 ** 블록 전까지 텍스트 추출"""
-            pattern = rf"\*\*{re.escape(label)}\*\*\n(.*?)(?=\n\*\*|\Z)"
-            sm = re.search(pattern, body, re.S)
-            return sm.group(1).strip() if sm else ""
-
-        result[(type1, type2)] = {
-            "name":        char_name,
-            "tagline":     tagline,
-            "quote":       quote,
-            "quote_attr":  quote_attr,
-            "intro":       extract_section("이런 사람입니다"),
-            "strength":    extract_section("가장 빛나는 순간"),
-            "trap":        extract_section("이 유형의 함정"),
-            "perception":  extract_section("다른 사람 눈에 비치는 당신"),
-            "advice":      extract_section("지금 필요한 한 가지"),
-        }
-
-    return result
+def get_norm_dist():
+    d = get_meta_dict().get("norm_dist")
+    try:
+        return json.loads(d) if d else None
+    except Exception:
+        return None
 
 
-# ─────────────────────────────────────────────
-# Google Sheets — v7.4 방식 완전 복원
-# @st.cache_resource 없음 — 캐시 시 HTTP 세션 손실로 오류 발생
-# ─────────────────────────────────────────────
-def get_gsheet_client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
+def raw_to_pct(raw, dist):
+    n = len(dist)
+    le = sum(1 for x in dist if x <= raw)
+    pct = round(le / n * 100)
+    top = max(1, round((100 - pct) / 10) * 10)
+    return pct, f"상위 약 {top}% 안에 포함됩니다"
+
+
+# ── 결과 메일 ──────────────────────────────────────────────────────────────────
+def send_result_email(to_email, pct_label, type_display, comment):
+    sender = st.secrets["EMAIL_ADDRESS"]
+    pw = st.secrets["EMAIL_APP_PW"]
+    lines = [
+        "AIQ 진단 결과 안내",
+        "",
+        f"· 상대 위치: {pct_label}",
+        f"· 유형 경향: {type_display}",
     ]
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=scopes
-    )
-    return gspread.authorize(creds)
+    if comment:
+        lines += ["", f"· 행동 근거: {comment}"]
+    lines += ["", "※ 부산대 직원 표본 기준 상대 위치이며, 점수는 구간으로 해석하시기 바랍니다.",
+              "※ 본 결과는 잠정(베타)입니다."]
+    msg = MIMEText("\n".join(lines), _charset="utf-8")
+    msg["Subject"] = "[AIQ] 진단 결과 안내"
+    msg["From"] = formataddr(("AIQ 진단", sender))
+    msg["To"] = to_email
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as s:
+        s.starttls()
+        s.login(sender, pw)
+        s.sendmail(sender, [to_email], msg.as_string())
 
 
-# ─────────────────────────────────────────────
-# L1 문항 풀 — Google Sheets 외부화 (v9.2)
-# 탭: questions  ·  열: no / text / type / reverse / active
-# ─────────────────────────────────────────────
-import random
+# ── 최초 200 일괄 발송(관리자 1클릭·중복방지·재실행 가능) ──────────────────────
+def send_pending_results(progress=None):
+    """result_sent != '1' 이고 백분위가 있는 유효 행을 id_map 이메일로 발송, 발송분 표시."""
+    import time
+    from gspread.utils import rowcol_to_a1
 
-VALID_TYPES = ("설계자", "상상가", "실행", "의존")
-MIN_FWD_PER_TYPE = 2  # 유형별 순방향 최소 (v10.0: 출제 2문항)
-MIN_REV_PER_TYPE = 1  # 유형별 역방향 최소 (v10.0: 출제 1문항)
-# 세션 출제 = 유형별 (순방향 2 + 역방향 1) = 총 12문항. 유형 분류 전용, 점수 미산출.
+    rws = get_ws(RESP_WS, RESP_HEADER)
+    rrows = rws.get_all_values()
+    rhead, rdata = rrows[0], rrows[1:]
+    i_serial = rhead.index("serial")
+    i_valid = rhead.index("valid_flag")
+    i_pct = rhead.index("aiq_pct")
+    i_lbl = rhead.index("pct_label")
+    i_type = rhead.index("type_display")
+    i_cmt = rhead.index("comment")
+    i_sent = rhead.index("result_sent")
 
+    # serial → email
+    iws = get_ws(IDMAP_WS, IDMAP_HEADER)
+    email_of = {r[0]: r[2] for r in iws.get_all_values()[1:] if len(r) >= 3}
 
-def _to_bool(v) -> bool:
-    """시트 셀 값을 bool로 정규화 (TRUE/1/y/yes 허용)"""
-    return str(v).strip().upper() in ("TRUE", "1", "Y", "YES")
+    targets = []  # (row_idx_in_data, serial, email, pct_label, type_display, comment)
+    for idx, r in enumerate(rdata):
+        if (r[i_valid] == "유효" and r[i_pct] not in ("", None)
+                and r[i_sent] != "1" and email_of.get(r[i_serial])):
+            targets.append((idx, r[i_serial], email_of[r[i_serial]],
+                            r[i_lbl], r[i_type], r[i_cmt]))
 
-
-def _bootstrap_questions_sheet(ss) -> None:
-    """questions 탭이 없으면 폴백 20문항으로 생성한다."""
-    ws = ss.add_worksheet(title="questions", rows=200, cols=5)
-    ws.append_row(["no", "text", "type", "reverse", "active"])
-    rows = [[no, text, typ, str(rev).upper(), "TRUE"]
-            for (no, text, typ, rev) in QUESTIONS_FALLBACK]
-    ws.append_rows(rows)
-
-
-@st.cache_data(ttl=300)
-def load_question_pool() -> list | None:
-    """
-    questions 탭에서 활성 문항을 로드한다.
-    반환: [(no:int, text:str, type:str, reverse:bool), ...] 또는 실패 시 None
-    - 탭이 없으면 폴백 문항으로 자동 생성 후 그것을 반환
-    - no 중복 시 첫 번째만 유지
-    - 캐시 ttl=300 — 시트 수정 후 최대 5분 내 반영
-    """
-    try:
-        gc = get_gsheet_client()
-        ss = gc.open(SHEET_NAME)
+    total = len(targets)
+    sent_rows = []
+    for k, (idx, serial, email, label, tdisp, cmt) in enumerate(targets):
         try:
-            ws = ss.worksheet("questions")
-        except gspread.WorksheetNotFound:
-            _bootstrap_questions_sheet(ss)
-            ws = ss.worksheet("questions")
-
-        records = ws.get_all_records()
-        pool, seen = [], set()
-        for r in records:
-            if not _to_bool(r.get("active", "")):
-                continue
-            try:
-                no = int(r.get("no", 0))
-            except (TypeError, ValueError):
-                continue
-            text = str(r.get("text", "")).strip()
-            typ  = str(r.get("type", "")).strip()
-            if no <= 0 or no in seen or not text or typ not in VALID_TYPES:
-                continue
-            seen.add(no)
-            pool.append((no, text, typ, _to_bool(r.get("reverse", ""))))
-        return pool if pool else None
-    except Exception:
-        return None
+            send_result_email(email, label, tdisp, cmt)
+            sent_rows.append(idx)
+        except Exception:
+            pass  # 실패분은 result_sent 미표시 → 다음 실행에서 재시도
+        # 20건마다 발송표시 flush(중단되어도 그만큼은 보존)
+        if len(sent_rows) >= 20:
+            _flush_sent(rws, i_sent, sent_rows, rowcol_to_a1)
+            sent_rows = []
+        if progress and total:
+            progress.progress(min(1.0, (k + 1) / total), text=f"발송 {k+1}/{total}")
+        time.sleep(0.4)  # Gmail 스로틀 회피
+    if sent_rows:
+        _flush_sent(rws, i_sent, sent_rows, rowcol_to_a1)
+    return total
 
 
-def validate_pool(pool: list) -> bool:
-    """유형별 순방향 ≥2, 역방향 ≥1 확보 여부 검증 (v10.0)"""
-    if not pool:
-        return False
-    fwd = {t: 0 for t in VALID_TYPES}
-    rev = {t: 0 for t in VALID_TYPES}
-    for (_, _, typ, reverse) in pool:
-        (rev if reverse else fwd)[typ] += 1
-    return all(fwd[t] >= MIN_FWD_PER_TYPE and rev[t] >= MIN_REV_PER_TYPE
-               for t in VALID_TYPES)
+def _flush_sent(ws, i_sent, row_idxs, rowcol_to_a1):
+    """data 인덱스 목록의 result_sent 셀을 '1'로 batch 표시."""
+    reqs = []
+    for idx in row_idxs:
+        cell = rowcol_to_a1(idx + 2, i_sent + 1)
+        reqs.append({"range": f"{cell}:{cell}", "values": [["1"]]})
+    if reqs:
+        ws.batch_update(reqs, value_input_option="USER_ENTERED")
 
 
-def build_question_set() -> list:
-    """
-    문항 풀에서 유형별 순방향 2 + 역방향 1 랜덤 추출 → 셔플하여 12문항 반환.
-    풀 로드 실패 또는 제약 미달 시 QUESTIONS_FALLBACK 반환.
-    호출 측에서 session_state에 1회 저장하여 세션 내 고정해야 한다.
-    """
-    pool = load_question_pool()
-    if not pool or not validate_pool(pool):
-        pool = list(QUESTIONS_FALLBACK)
-    fwd = {t: [] for t in VALID_TYPES}
-    rev = {t: [] for t in VALID_TYPES}
-    for q in pool:
-        (rev if q[3] else fwd)[q[2]].append(q)
-    selected = []
-    for t in VALID_TYPES:
-        selected.extend(random.sample(fwd[t], MIN_FWD_PER_TYPE))
-        selected.extend(random.sample(rev[t], MIN_REV_PER_TYPE))
-    random.shuffle(selected)
-    return selected
+# ──────────────────────────────────────────────────────────────────────────────
+# 결과 화면 (콜드스타트: 유형·근거만 / 점수는 보류 안내)
+# ──────────────────────────────────────────────────────────────────────────────
+def render_done():
+    ss = st.session_state
+    sc = ss.scored
+    l1 = ss.l1_result
+    st.success(f"✅ 응답이 저장되었습니다 · 시리얼 {ss.serial}")
+    st.markdown("### AI 활용 성향 진단 결과")
 
+    # 유형 카드(경향)
+    st.markdown(f"#### 유형 경향")
+    st.markdown(f"**{l1['type_display']}**")
+    st.caption("고정된 분류가 아니라 현재 경향이며, 반복할수록 이동을 볼 수 있습니다.")
 
-# ─────────────────────────────────────────────
-# 문항 관리자 — 시트 쓰기 함수 (v9.3)
-# 관리자 화면은 캐시를 거치지 않고 항상 시트를 직접 읽는다.
-# ─────────────────────────────────────────────
-def _questions_ws():
-    gc = get_gsheet_client()
-    ss = gc.open(SHEET_NAME)
-    try:
-        return ss.worksheet("questions")
-    except gspread.WorksheetNotFound:
-        _bootstrap_questions_sheet(ss)
-        return ss.worksheet("questions")
+    prof = TYPE_PROFILES.get(l1["primary"]) if l1.get("primary") else None
+    if prof:
+        st.markdown(f"> {prof['one_line']}")
+        for h, body in prof["sections"].items():
+            st.markdown(f"**{h}**")
+            st.write(body)
 
+    # 행동 근거 / 판단보류
+    st.markdown("---")
+    if sc["mti_status"] == "scored":
+        if sc.get("comment"):
+            st.markdown("**행동 근거**")
+            st.info(sc["comment"])
+    elif sc["mti_status"] == "undetermined":
+        st.warning("행동 변화를 관측할 만큼 대화가 진행되지 않았습니다. 조금 더 길게 대화해 다시 측정해 보세요.")
+        if sc.get("comment"):
+            st.caption(sc["comment"])
+    else:
+        st.warning("채점을 완료하지 못했습니다. 다시 시도해 주세요.")
 
-def admin_fetch_records() -> list:
-    """관리자용 — 비캐시 전체 행 조회. 반환 행 순서 = 시트 행 순서."""
-    return _questions_ws().get_all_records()
-
-
-def _active_count_by_type(records: list) -> dict:
-    """유형별 (순방향, 역방향) 활성 문항 수"""
-    counts = {t: [0, 0] for t in VALID_TYPES}  # [fwd, rev]
-    for r in records:
-        typ = str(r.get("type", "")).strip()
-        if typ in VALID_TYPES and _to_bool(r.get("active", "")):
-            idx = 1 if _to_bool(r.get("reverse", "")) else 0
-            counts[typ][idx] += 1
-    return counts
-
-
-def can_remove_from_active(records: list, no) -> tuple:
-    """
-    활성 문항을 비활성/삭제해도 방향별 최소 제약(순방향 2·역방향 1)이 유지되는지 검사.
-    반환: (가능 여부, 사유 메시지)
-    비활성 문항은 항상 제거 가능.
-    """
-    target = next((r for r in records if str(r.get("no")) == str(no)), None)
-    if target is None:
-        return False, "해당 번호의 문항이 없습니다."
-    if not _to_bool(target.get("active", "")):
-        return True, ""
-    typ = str(target.get("type", "")).strip()
-    is_rev = _to_bool(target.get("reverse", ""))
-    counts = _active_count_by_type(records)
-    fwd, rev = counts.get(typ, [0, 0])
-    if is_rev and rev <= MIN_REV_PER_TYPE:
-        return False, f"'{typ}' 유형 역방향 활성 문항이 최소치({MIN_REV_PER_TYPE}개)입니다. 먼저 같은 유형의 역방향 문항을 추가하세요."
-    if (not is_rev) and fwd <= MIN_FWD_PER_TYPE:
-        return False, f"'{typ}' 유형 순방향 활성 문항이 최소치({MIN_FWD_PER_TYPE}개)입니다. 먼저 같은 유형의 순방향 문항을 추가하세요."
-    return True, ""
-
-
-def admin_add_question(text: str, typ: str, reverse: bool) -> int:
-    """새 문항 추가. no는 자동 채번(최대값+1). 반환: 부여된 no."""
-    ws = _questions_ws()
-    records = ws.get_all_records()
-    nos = []
-    for r in records:
-        try:
-            nos.append(int(r.get("no", 0)))
-        except (TypeError, ValueError):
-            continue
-    new_no = (max(nos) + 1) if nos else 1
-    ws.append_row([new_no, text.strip(), typ, "TRUE" if reverse else "FALSE", "TRUE"])
-    st.cache_data.clear()
-    return new_no
-
-
-def admin_set_active(no, active: bool) -> bool:
-    """활성/비활성 토글. active 열은 5번째 열."""
-    ws = _questions_ws()
-    records = ws.get_all_records()
-    for i, r in enumerate(records):
-        if str(r.get("no")) == str(no):
-            ws.update_cell(i + 2, 5, "TRUE" if active else "FALSE")
-            st.cache_data.clear()
-            return True
-    return False
-
-
-def admin_delete_question(no) -> bool:
-    """문항 행 삭제. 헤더가 1행이므로 레코드 i번째 = 시트 i+2행."""
-    ws = _questions_ws()
-    records = ws.get_all_records()
-    for i, r in enumerate(records):
-        if str(r.get("no")) == str(no):
-            ws.delete_rows(i + 2)
-            st.cache_data.clear()
-            return True
-    return False
-
-
-# ─────────────────────────────────────────────
-# 관리자 이메일 OTP 인증 (v9.4)
-# secrets: ADMIN_EMAILS(쉼표 구분 허용 목록), SMTP_USER, SMTP_PASSWORD
-# ─────────────────────────────────────────────
-OTP_TTL_SEC      = 600   # 코드 유효 10분
-OTP_MAX_ATTEMPTS = 5     # 검증 시도 한도
-OTP_RESEND_SEC   = 60    # 재발송 쿨다운
-
-
-def _admin_email_allowlist() -> list:
-    raw = st.secrets.get("ADMIN_EMAILS", "")
-    return [e.strip().lower() for e in str(raw).split(",") if e.strip()]
-
-
-def _send_otp_email(to_email: str, code: str) -> bool:
-    """Gmail SMTP(587/STARTTLS)로 6자리 코드 발송. 실패 시 False."""
-    user = st.secrets.get("SMTP_USER", "")
-    pw   = st.secrets.get("SMTP_PASSWORD", "")
-    if not user or not pw:
-        return False
-    body = (
-        f"AIQ 관리자 인증 코드: {code}\n\n"
-        f"10분 내에 입력하세요.\n"
-        f"본인이 요청하지 않았다면 이 메일을 무시하세요."
-    )
-    msg = MIMEText(body, _charset="utf-8")
-    msg["Subject"] = "AIQ 관리자 인증 코드"
-    msg["From"]    = user
-    msg["To"]      = to_email
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as s:
-            s.starttls(context=ssl.create_default_context())
-            s.login(user, pw)
-            s.send_message(msg)
-        return True
-    except Exception:
-        return False
-
-
-def _store_otp(email: str, code: str) -> None:
-    """OTP는 원문이 아닌 SHA-256 해시로만 세션에 보관."""
-    st.session_state.otp_hash      = hashlib.sha256(code.encode()).hexdigest()
-    st.session_state.otp_email     = email
-    st.session_state.otp_expires   = time.time() + OTP_TTL_SEC
-    st.session_state.otp_attempts  = 0
-    st.session_state.otp_last_sent = time.time()
-
-
-def _clear_otp() -> None:
-    for k in ("otp_hash", "otp_email", "otp_expires", "otp_attempts"):
-        st.session_state.pop(k, None)
-
-
-def _verify_otp(entered: str) -> tuple:
-    """반환: (성공 여부, 실패 사유)"""
-    if not st.session_state.get("otp_hash"):
-        return False, "발송된 코드가 없습니다. 먼저 코드를 발송하세요."
-    if time.time() > st.session_state.get("otp_expires", 0):
-        _clear_otp()
-        return False, "코드가 만료되었습니다(10분). 다시 발송하세요."
-    if st.session_state.get("otp_attempts", 0) >= OTP_MAX_ATTEMPTS:
-        _clear_otp()
-        return False, "시도 횟수를 초과했습니다. 다시 발송하세요."
-    st.session_state.otp_attempts = st.session_state.get("otp_attempts", 0) + 1
-    h = hashlib.sha256(entered.strip().encode()).hexdigest()
-    if hmac.compare_digest(h, st.session_state.otp_hash):
-        _clear_otp()
-        return True, ""
-    remain = OTP_MAX_ATTEMPTS - st.session_state.otp_attempts
-    return False, f"코드가 일치하지 않습니다. (남은 시도 {remain}회)"
-
-
-def save_result(name: str, birth: str,
-                type1: str, type2: str, type_scores: dict,
-                q1: str, q1f: str,
-                q2a: str, q2b: str, q2f: str, q2f_text: str,
-                qli: int, mti: int, aiq: int,
-                answers: dict) -> str | None:
-    """
-    진단 결과를 단일 시트(responses)에 저장한다.
-
-    연결: v7.4 방식 (gspread.authorize, @cache 없음)
-    저장: 단일 시트, 단일 append_row 1회
-    채번: timestamp 기반 자동 생성
-    """
-    try:
-        gc = get_gsheet_client()
-        ss = gc.open(SHEET_NAME)
-        ts     = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
-        serial = "AIQ_" + datetime.now(KST).strftime("%m%d_%H%M%S")
-
-        try:
-            ws = ss.worksheet("responses")
-        except gspread.WorksheetNotFound:
-            ws = ss.add_worksheet(title="responses", rows=1, cols=20)
-            ws.append_row([
-                "serial", "timestamp", "name", "birth",
-                "type1", "type2",
-                "score_designer", "score_imaginer", "score_executor", "score_follower",
-                "q1", "q1f", "q2a", "q2b", "q2f", "q2f_text",
-                "QLI", "MTI", "AIQ_index",
-                "q_answers"
-            ])
-
-        ws.append_row([
-            serial, ts, name, birth,
-            type1, type2,
-            type_scores.get("설계자", 0), type_scores.get("상상가", 0),
-            type_scores.get("실행", 0),   type_scores.get("의존", 0),
-            q1, q1f, q2a, q2b, q2f, q2f_text,
-            qli, mti, aiq,
-            str(answers)
-        ])
-        return serial
-
-    except Exception as e:
-        st.warning(f"저장 오류: {e}")
-        return None
-
-# ─────────────────────────────────────────────
-# CSS
-# ─────────────────────────────────────────────
-st.markdown("""
-<style>
-    .stApp { max-width: 760px; margin: 0 auto; }
-    .step-bar { display:flex; align-items:center; padding:.6rem 0;
-                margin-bottom:1.5rem; border-bottom:1px solid #e5e7eb; }
-    .step-item { display:flex; align-items:center; gap:6px; flex:1; }
-    .step-num  { width:22px; height:22px; border-radius:50%;
-                 display:flex; align-items:center; justify-content:center;
-                 font-size:11px; font-weight:600; }
-    .step-on   { background:#EBF4FF; color:#1D6FA8; border:1.5px solid #93C5FD; }
-    .step-done { background:#ECFDF5; color:#065F46; border:1.5px solid #6EE7B7; }
-    .step-off  { background:#F9FAFB; color:#9CA3AF; border:1px solid #E5E7EB; }
-    .step-lbl-on  { font-size:12px; font-weight:600; color:#111827; }
-    .step-lbl-off { font-size:12px; color:#9CA3AF; }
-    .step-div  { flex:none; width:20px; height:1px; background:#E5E7EB; margin:0 2px; }
-    .scn-box   { background:#F0F7FF; border-left:3px solid #3B82F6;
-                 border-radius:6px; padding:1rem 1.2rem; margin-bottom:1rem; }
-    .scn-title { font-size:11px; font-weight:600; color:#6B7280;
-                 text-transform:uppercase; letter-spacing:.06em; margin-bottom:.4rem; }
-    .scn-text  { font-size:14px; color:#111827; line-height:1.7; margin:0; }
-    .report-header { border-bottom:2px solid #1F3864; padding-bottom:.85rem; margin-bottom:1.5rem; }
-    .report-title  { font-size:11px; font-weight:600; color:#1D6FA8;
-                     letter-spacing:.15em; text-transform:uppercase; margin:0 0 .25rem; }
-    .report-name   { font-size:22px; font-weight:500; color:#111827; margin:0 0 .5rem; }
-    .report-meta   { display:flex; gap:1.5rem; font-size:12px; color:#6B7280; flex-wrap:wrap; }
-    .report-meta span strong { color:#374151; font-weight:500; margin-right:.25rem; }
-    .aiq-hero  { text-align:center; padding:2.5rem 1rem 2rem;
-                 background:linear-gradient(180deg,#F0F7FF 0%,#FFFFFF 100%);
-                 border-radius:12px; margin:0 0 1.5rem; border:1px solid #DBEAFE; }
-    .aiq-label { font-size:13px; font-weight:500; color:#6B7280;
-                 letter-spacing:.08em; text-transform:uppercase; margin:0 0 .5rem; }
-    .aiq-value { font-size:clamp(96px, 24vw, 160px); font-weight:700; color:#1D6FA8;
-                 line-height:1; margin:0; letter-spacing:-4px; }
-    .aiq-badge-row { margin-top:.75rem; display:flex; justify-content:center;
-                     gap:8px; flex-wrap:wrap; }
-    .aiq-badge { font-size:11px; font-weight:500; color:#1D6FA8;
-                 background:#DBEAFE; padding:3px 10px; border-radius:4px; }
-    .section-title { font-size:24px; font-weight:500; color:#111827; margin:1rem 0 .25rem; }
-    .axis-tag      { font-size:13px; color:#6B7280; margin:0 0 .75rem; }
-    .type-quote    { border-left:3px solid #D1D5DB; padding:0 0 0 1rem;
-                     margin:.5rem 0 1.5rem; color:#4B5563; font-size:13px; line-height:1.7; }
-    .coord-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin:.75rem 0; }
-    .cc     { border:1px solid #E5E7EB; border-radius:6px; padding:8px 10px;
-              font-size:12px; background:#F9FAFB; }
-    .cc-hl  { background:#EBF4FF; border-color:#93C5FD; }
-    .cc-name { font-weight:600; font-size:13px; display:block; color:#111827; }
-    .cc-tag  { font-size:11px; color:#6B7280; }
-    .cc-hl .cc-name { color:#1D6FA8; }
-    .sub-section-title { font-size:13px; font-weight:600; color:#6B7280;
-                         margin:0 0 .75rem; letter-spacing:.04em; text-transform:uppercase; }
-    .sub-metrics { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin:.75rem 0; }
-    .sm      { padding:.5rem .7rem; border:1px solid #E5E7EB; border-radius:6px; background:#F9FAFB; }
-    .sm-lbl  { font-size:10px; color:#9CA3AF; margin:0 0 2px; }
-    .sm-val  { font-size:14px; font-weight:500; color:#4B5563; margin:0; }
-    .second-rank { font-size:12px; color:#6B7280; margin-top:.5rem; }
-</style>
-""", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────
-# session_state 초기화
-# ─────────────────────────────────────────────
-def init_state():
-    defaults = {
-        "stage":         0,
-        "user_name":     "",
-        "user_birth":    "",
-        "consent_given": False,
-        "questions":     [],    # 세션 고정 문항 세트 (v9.2)
-        "answers":       {},    # 12문항 응답
-        "type_scores":   {},
-        "type1":         "",
-        "type2":         "",
-        # 2단계 대화 (v10.0)
-        "dialogue":        [],
-        "transition_turn": 0,
-        "score_comment":   "",
-        "low_variance":    False,
-        # 결과
-        "qli_score": 0,
-        "mti_score": 0,
-        "aiq_index": 0,
-        "serial":    "",
-        "saved":     False,
-        "save_attempted": False,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-init_state()
-
-# ─────────────────────────────────────────────
-# 단계 표시 바
-# ─────────────────────────────────────────────
-def step_bar(current: int):
-    steps = [(1,"유형 진단"), (2,"AI 대화"), (3,"결과")]
-    html = '<div class="step-bar">'
-    for i, (num, label) in enumerate(steps):
-        if num < current:
-            cn, cl, icon = "step-num step-done", "step-lbl-off", "✓"
-        elif num == current:
-            cn, cl, icon = "step-num step-on",   "step-lbl-on",  str(num)
-        else:
-            cn, cl, icon = "step-num step-off",  "step-lbl-off", str(num)
-        html += f'<div class="step-item"><div class="{cn}">{icon}</div><span class="{cl}">{label}</span></div>'
-        if i < len(steps)-1:
-            html += '<div class="step-div"></div>'
-    html += '</div>'
-    st.markdown(html, unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────
-# stage_0: 진입 화면
-# ─────────────────────────────────────────────
-def stage_0():
-    st.markdown("## AIQ 파일럿 진단")
-    st.markdown("""
-AI와 나는 어떻게 함께 사고하는가를 측정합니다.
-
-- **12개 행동 문항**으로 AI 협업 사고 유형을 분류합니다
-- **AI와의 열린 대화**(최대 7턴)로 질문 설계력과 사고 전환 점수를 산출합니다
-- 소요 시간: 약 7~10분
-    """)
-    st.divider()
-
-    st.markdown("### 응답자 정보")
-    col1, col2 = st.columns(2)
-    with col1:
-        name = st.text_input("이름", max_chars=20, placeholder="예: 홍길동",
-                             value=st.session_state.user_name)
-    with col2:
-        birth = st.text_input("생년월일 (YYYYMMDD)", max_chars=8,
-                              placeholder="예: 19950315",
-                              value=st.session_state.user_birth)
-    st.caption("※ 결과 보고와 향후 재진단 시 식별을 위해 사용됩니다.")
-    st.divider()
-
-    consent = st.checkbox(
-        "이름과 생년월일을 진단 결과 보고 및 데이터 분석 목적으로 수집·이용하는 것에 동의합니다.",
-        value=st.session_state.consent_given
-    )
-
-    name_ok  = validate_name(name)
-    birth_ok = validate_birth(birth)
-    ready    = name_ok and birth_ok and consent
-
-    if name  and not name_ok:  st.warning("이름은 2~20자의 한글/영문으로 입력해주세요.")
-    if birth and not birth_ok: st.warning("생년월일은 YYYYMMDD 8자리 형식이어야 합니다.")
-    if not consent:            st.caption("진단을 시작하려면 동의에 체크해주세요.")
-
-    if st.button("진단 시작 →", type="primary", use_container_width=True, disabled=not ready):
-        st.session_state.user_name     = name.strip()
-        st.session_state.user_birth    = birth.strip()
-        st.session_state.consent_given = True
-        st.session_state.questions     = build_question_set()  # 세션 고정 (v9.2)
-        st.session_state.stage = 1
-        st.rerun()
-
-# ─────────────────────────────────────────────
-# stage_1: 20문항 유형 진단
-# ─────────────────────────────────────────────
-def stage_1():
-    step_bar(1)
-    st.markdown("### AI와 나는 어떻게 함께 사고하는가")
-    st.caption("12개 행동 문항에 응답해주세요. 정답이 없으며 평소 습관을 기준으로 선택하세요.")
-    st.divider()
-
-    SCALE = ["① 거의 안 그렇다", "② 가끔 그렇다", "③ 자주 그렇다", "④ 항상 그렇다"]
-
-    # 세션 고정 문항 (직접 URL 진입 등으로 비어 있으면 즉시 구성)
-    if not st.session_state.questions:
-        st.session_state.questions = build_question_set()
-    questions = st.session_state.questions
-
-    with st.form("q_form"):
-        answers = {}
-        for (no, text, typ, reverse) in questions:
-            st.markdown(f"**Q{no:02d}.** {text}")
-            prev       = st.session_state.answers.get(no)
-            prev_index = (prev - 1) if prev else None
-            val = st.radio(
-                label=f"q{no}", options=[1,2,3,4],
-                format_func=lambda x: SCALE[x-1],
-                index=prev_index, horizontal=True,
-                label_visibility="collapsed", key=f"q{no}"
-            )
-            answers[no] = val
-            st.markdown("")
-
-        answered = len([v for v in answers.values() if v is not None])
-        st.caption(f"{answered} / {len(questions)} 문항 완료")
-        submitted = st.form_submit_button("✅ 완료 — AI 대화로 이동", use_container_width=True)
-
-    if submitted:
-        missing = [no for no, v in answers.items() if v is None]
-        if missing:
-            st.warning(f"아직 응답하지 않은 문항: Q{', Q'.join(f'{n:02d}' for n in missing)}")
-        else:
-            st.session_state.answers      = answers
-            st.session_state.type_scores  = compute_type_scores(answers, questions)
-            st.session_state.low_variance = (len(set(answers.values())) == 1)
-            t1, t2 = compute_top_types(st.session_state.type_scores)
-            st.session_state.type1 = t1
-            st.session_state.type2 = t2
-            st.session_state.stage = 2
-            st.rerun()
-
-# ─────────────────────────────────────────────
-# stage_2: 시나리오 A — QLI 측정
-# ─────────────────────────────────────────────
-def stage_2():
-    step_bar(2)
-    st.markdown("### AI와의 열린 대화")
-    st.markdown(f"""
-<div class="scn-box"><p class="scn-title">논의 주제</p>
-<p class="scn-text">AI와 함께 <strong>{DIALOGUE_TOPIC}</strong>에 대해 논의합니다.<br>
-AI에게 가장 먼저 어떤 질문을 하시겠습니까? 자유롭게 작성해 주세요.</p></div>
-""", unsafe_allow_html=True)
-    st.caption(f"대화는 최대 {MAX_USER_TURNS}번까지 이어갈 수 있고, 충분하다고 느끼면 언제든 마칠 수 있습니다.")
-    st.divider()
-
-    dialogue = st.session_state.dialogue
-    user_turns = sum(1 for m in dialogue if m["role"] == "user")
-
-    # 대화 이력 표시
-    for m in dialogue:
-        with st.chat_message("user" if m["role"] == "user" else "assistant"):
-            st.markdown(m["content"])
-
-    # 입력 (상한 도달 전까지)
-    if user_turns < MAX_USER_TURNS:
-        user_msg = st.chat_input(
-            "첫 질문을 입력하세요" if user_turns == 0 else "후속 질문 또는 의견을 입력하세요"
+    # 점수: 잠금 후(백분위 있음)면 크게 표시, 콜드스타트면 보류 안내
+    st.markdown("---")
+    if ss.get("pct_label"):
+        st.markdown("#### AIQ 결과 (상대 위치)")
+        st.markdown(
+            f"<div style='font-size:30px;font-weight:800;margin:6px 0'>{ss['pct_label']}</div>",
+            unsafe_allow_html=True,
         )
-        if user_msg and user_msg.strip():
-            dialogue.append({"role": "user", "content": user_msg.strip()})
-            with st.chat_message("user"):
-                st.markdown(user_msg.strip())
-            with st.spinner("AI가 답변 중..."):
-                reply = generate_ai_reply(dialogue)
-            dialogue.append({"role": "assistant", "content": reply})
-            st.session_state.dialogue = dialogue
-            st.rerun()
+        st.caption("부산대 직원 표본 기준 상대 위치 · 점수는 구간으로 해석하세요 · 잠정(베타)")
+        st.caption("동일 내용을 입력하신 이메일로도 보냈습니다.")
     else:
-        st.info(f"최대 {MAX_USER_TURNS}턴에 도달했습니다. 논의를 마치고 결과를 확인하세요.")
-
-    # 종료 버튼 — 최소 발화 수 충족 시
-    if user_turns >= MIN_TURNS_TO_FINISH:
-        st.divider()
-        if st.button("논의 마치고 결과 보기 →", type="primary", use_container_width=True):
-            with st.spinner("응답을 분석 중입니다..."):
-                qli, mti, tt, cm = score_dialogue(st.session_state.dialogue)
-            st.session_state.qli_score       = qli
-            st.session_state.mti_score       = mti
-            st.session_state.aiq_index       = compute_aiq(qli, mti)
-            st.session_state.transition_turn = tt
-            st.session_state.score_comment   = cm
-            st.session_state.stage = 3
-            st.rerun()
-    elif user_turns == 1:
-        st.caption("AI의 답변을 보고 한 번 이상 더 이어가면 논의를 마칠 수 있습니다.")
-
-# ─────────────────────────────────────────────
-# stage_3: 결과 리포트
-# ─────────────────────────────────────────────
-def stage_3():
-    type1     = st.session_state.type1
-    type2     = st.session_state.type2
-    type_sc   = st.session_state.type_scores
-    qli       = st.session_state.qli_score
-    mti       = st.session_state.mti_score
-    aiq       = st.session_state.aiq_index
-
-    # 저장 — 1회만
-    if not st.session_state.save_attempted:
-        st.session_state.save_attempted = True
-        dlg = st.session_state.dialogue
-        first_q  = next((m["content"] for m in dlg if m["role"] == "user"), "")[:500]
-        u_turns  = sum(1 for m in dlg if m["role"] == "user")
-        import json as _json
-        transcript_json = _json.dumps(dlg, ensure_ascii=False)[:40000]
-        # 시트 열 재활용: q1=첫 질문 / q1f=발화 수 / q2a=전환 턴 / q2f_text=대화 전문(JSON)
-        serial = save_result(
-            name=st.session_state.user_name,
-            birth=st.session_state.user_birth,
-            type1=type1, type2=type2,
-            type_scores=type_sc,
-            q1=first_q,
-            q1f=str(u_turns),
-            q2a=str(st.session_state.transition_turn),
-            q2b="",
-            q2f="",
-            q2f_text=transcript_json,
-            qli=qli, mti=mti, aiq=aiq,
-            answers=st.session_state.answers
+        st.caption(
+            "AIQ 점수는 부산대 직원 표본이 모두 모인 뒤(잠정·베타) 기준 분포를 만들어 "
+            "이메일로 일괄 발송됩니다. 지금은 점수를 표시하지 않습니다."
         )
-        if serial:
-            st.session_state.serial = serial
-            st.session_state.saved  = True
-
-    # 보고서 헤더
-    name_disp  = st.session_state.user_name or "anonymous"
-    birth_raw  = st.session_state.user_birth or ""
-    birth_disp = f"{birth_raw[:4]}.{birth_raw[4:6]}.{birth_raw[6:]}" if len(birth_raw)==8 else ""
-    serial_disp = st.session_state.serial or "—"
-    diag_time  = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
-
-    st.markdown(f'''
-    <div class="report-header">
-      <p class="report-title">AIQ Diagnostic Report</p>
-      <p class="report-name">AI 공생 지수 진단 결과</p>
-      <div class="report-meta">
-        <span><strong>응답자</strong>{name_disp} ({birth_disp})</span>
-        <span><strong>시리얼</strong>{serial_disp}</span>
-        <span><strong>진단일</strong>{diag_time}</span>
-        <span><strong>버전</strong>AIQ v10.0 · 프로토타입</span>
-      </div>
-    </div>
-    ''', unsafe_allow_html=True)
-
-    # MD 콘텐츠 로드 (캐시됨, 실패 시 빈 dict)
-    content = load_content()
-    combo_data = content.get((type1, type2), None)
-
-    # 캐릭터명 + 위트 — MD 우선, fallback은 TYPE_COMBOS
-    combo_fallback = TYPE_COMBOS.get((type1, type2), None)
-    if combo_data:
-        combo_name = combo_data["name"]
-        combo_desc = combo_data["tagline"]
-    elif combo_fallback:
-        combo_name = combo_fallback[0]
-        combo_desc = combo_fallback[1]
-    else:
-        combo_name = type1.replace("형", "")
-        combo_desc = TYPE_DESC.get(type1, "")
-
-    # 점수 카드 — 점수만 단독·대형 표시 (v10.0)
-    st.markdown(f'''
-    <div class="aiq-hero">
-      <p class="aiq-label">AIQ</p>
-      <p class="aiq-value">{aiq}</p>
-    </div>
-    ''', unsafe_allow_html=True)
-
-    # 유형 카드 — 점수와 분리 (v10.0)
-    st.markdown(f'''
-    <div style="text-align:center; padding:1.25rem 1rem; background:#FFFFFF;
-                border:1px solid #E5E7EB; border-radius:12px; margin:0 0 1.5rem;">
-      <span class="aiq-badge" style="font-size:14px; padding:5px 16px;">{combo_name}</span>
-      <p style="margin:.7rem 0 0; font-size:13px; color:#6B7280;">"{combo_desc}"</p>
-    </div>
-    ''', unsafe_allow_html=True)
-
-    # 무변별 응답 경고 (v10.0)
-    if st.session_state.get("low_variance", False):
-        st.warning("모든 문항에 동일한 응답을 하셨습니다. 유형 판정의 신뢰도가 낮으므로 참고용으로만 활용하세요.")
-
-    # 유형 설명
-    axis = TYPE_AXIS.get(type1, ("",""))
-    st.markdown(f'<h2 class="section-title">{combo_name}</h2>', unsafe_allow_html=True)
-    st.markdown(f'<p class="axis-tag">{type1} · {axis[0]} {axis[1]} — 1순위 &nbsp;|&nbsp; {type2} — 2순위</p>', unsafe_allow_html=True)
-    st.markdown(f'<p class="type-quote">{TYPE_DESC.get(type1,"")}</p>', unsafe_allow_html=True)
-    st.divider()
-
-    # 유형 좌표
-    st.markdown('<p class="sub-section-title">유형 좌표</p>', unsafe_allow_html=True)
-    type_order = ["상상가형","설계자형","의존형","실행형"]
-    labels_map = {"설계자":"설계자형","상상가":"상상가형","실행":"실행형","의존":"의존형"}
-    html = '<div class="coord-grid">'
-    for t in type_order:
-        is_first  = (t == type1)
-        is_second = (t == type2)
-        rank = "1순위" if is_first else ("2순위" if is_second else "")
-        cls  = "cc cc-hl" if is_first else "cc"
-        html += f'<div class="{cls}"><span class="cc-name">{t}{" ✦" if is_first else ""}</span><span class="cc-tag">{rank}</span></div>'
-    html += '</div>'
-    st.markdown(html, unsafe_allow_html=True)
-    if type2:
-        st.markdown(f'<p class="second-rank">2순위: {type2}</p>', unsafe_allow_html=True)
-    st.divider()
-
-    if combo_data:
-        # ─── MD 콘텐츠 풀버전 ───
-        # 명언 블록
-        if combo_data.get("quote"):
-            st.markdown(f'''
-            <div style="background:var(--color-background-secondary);
-                        border-left:3px solid var(--color-border-info);
-                        border-radius:0;padding:.85rem 1rem;margin:0 0 1rem;">
-              <p style="font-size:14px;font-weight:500;color:var(--color-text-primary);
-                        margin:0 0 .25rem;line-height:1.5;">"{combo_data["quote"]}"</p>
-              <p style="font-size:12px;color:var(--color-text-secondary);
-                        margin:0;font-style:italic;">{combo_data.get("quote_attr","")}</p>
-            </div>
-            ''', unsafe_allow_html=True)
-
-        # 5개 섹션
-        sections = [
-            ("이런 사람입니다",        "intro"),
-            ("가장 빛나는 순간",       "strength"),
-            ("이 유형의 함정",         "trap"),
-            ("다른 사람 눈에 비치는 당신", "perception"),
-        ]
-        for title, key in sections:
-            text = combo_data.get(key, "")
-            if text:
-                st.markdown(f'''
-                <div style="margin:0 0 1rem;">
-                  <p style="font-size:13px;font-weight:500;
-                            color:var(--color-text-primary);margin:0 0 .3rem;">{title}</p>
-                  <p style="font-size:13px;color:var(--color-text-secondary);
-                            line-height:1.75;margin:0;">{text}</p>
-                </div>
-                ''', unsafe_allow_html=True)
-
-        # 지금 필요한 한 가지 — 파란 박스
-        advice = combo_data.get("advice", "")
-        if advice:
-            st.markdown(f'''
-            <div style="background:var(--color-background-info);
-                        border-radius:var(--border-radius-md);
-                        padding:.85rem 1rem;margin:0 0 1rem;">
-              <p style="font-size:11px;font-weight:500;color:var(--color-text-info);
-                        letter-spacing:.06em;text-transform:uppercase;margin:0 0 .3rem;">
-                💡 지금 필요한 한 가지</p>
-              <p style="font-size:13px;color:var(--color-text-info);
-                        line-height:1.7;margin:0;">{advice}</p>
-            </div>
-            ''', unsafe_allow_html=True)
-
-    else:
-        # ─── fallback: 기존 TYPE_COMMENTS 코멘트 박스 ───
-        type1_score = st.session_state.type_scores.get(
-            next((k for k, v in TYPE_LABELS.items() if v == type1), ""), 0
-        )
-        level = get_type_level(type1_score)
-        if type1 in TYPE_COMMENTS and level in TYPE_COMMENTS[type1]:
-            comment, advice = TYPE_COMMENTS[type1][level]
-            st.markdown(f'''
-            <div style="background:var(--color-background-secondary);
-                        border:0.5px solid var(--color-border-tertiary);
-                        border-radius:var(--border-radius-md);
-                        padding:.9rem 1rem;margin-bottom:.75rem;
-                        font-size:13px;color:var(--color-text-secondary);line-height:1.7;">
-                {comment}
-            </div>
-            <div style="background:var(--color-background-info);
-                        border-radius:var(--border-radius-md);
-                        padding:.75rem 1rem;font-size:13px;
-                        color:var(--color-text-info);line-height:1.7;">
-                💡 {advice}
-            </div>
-            ''', unsafe_allow_html=True)
-
-    st.divider()
-
-    # 저장 상태
-    if st.session_state.saved:
-        st.caption(f"✅ 결과가 저장되었습니다.  ·  시리얼: {st.session_state.serial}")
-    else:
-        st.warning("저장 실패 — 운영자에게 알려주세요.")
 
     if st.button("처음으로 돌아가기"):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
+        for k in list(ss.keys()):
+            del ss[k]
         st.rerun()
 
-# ─────────────────────────────────────────────
-# 관리자 화면 (v9.3) — URL: ?mode=admin
-# ─────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 라우팅
+# ──────────────────────────────────────────────────────────────────────────────
+def render_flow():
+    ss = st.session_state
+    steps = ss.order  # 예: ["l1","l3"]
+    if ss.step < len(steps):
+        cur = steps[ss.step]
+        if cur == "l1":
+            render_l1()
+        else:
+            render_l3()
+        return
+
+    # 두 단계 완료 → 채점·저장(1회)
+    if not ss.get("scored"):
+        with st.spinner("응답을 채점하고 저장하는 중…"):
+            transcript, post_user = build_segments()
+            sc = score_dialogue(transcript, post_user)
+            ss.scored = sc
+            try:
+                was_locked = norm_locked()  # 내 저장 전에 이미 잠겼나(=나는 201+)
+                pct = label = ""
+                sent = ""
+                if was_locked and sc["valid"] and sc.get("aiq_raw") is not None:
+                    dist = get_norm_dist()
+                    if dist:
+                        p, l = raw_to_pct(sc["aiq_raw"], dist)
+                        ss.aiq_pct, ss.pct_label = p, l
+                        pct, label = p, l
+                        try:  # 201+ 본인 결과 메일 즉시 발송
+                            send_result_email(ss.email, l, ss.l1_result["type_display"], sc.get("comment"))
+                            sent = "1"
+                        except Exception:
+                            sent = ""
+                save_response(transcript, sc, pct, label, sent)
+                if not was_locked:
+                    maybe_normalize()  # 내가 200번째면 여기서 잠금·일괄 백분위 기입
+                    if norm_locked() and sc["valid"] and sc.get("aiq_raw") is not None:
+                        dist = get_norm_dist()
+                        if dist:
+                            ss.aiq_pct, ss.pct_label = raw_to_pct(sc["aiq_raw"], dist)
+            except Exception as e:
+                st.error(f"저장 오류: {e}")
+        st.rerun()
+
+    render_done()
+
+
 def render_admin():
-    st.markdown("## AIQ 문항 관리 (관리자)")
-
-    allow = _admin_email_allowlist()
-    if not allow:
-        st.error("ADMIN_EMAILS secret이 설정되지 않았습니다. (쉼표 구분 이메일 목록)")
-        st.stop()
-    if not (st.secrets.get("SMTP_USER", "") and st.secrets.get("SMTP_PASSWORD", "")):
-        st.error("SMTP_USER / SMTP_PASSWORD secret이 설정되지 않았습니다.")
-        st.stop()
-
-    # 인증 — 이메일 OTP (v9.4)
-    if not st.session_state.get("admin_authed", False):
-        st.markdown("#### 관리자 이메일 인증")
-        email = st.text_input("관리자 이메일", key="adm_email_in",
-                              placeholder="등록된 관리자 이메일 입력")
-
-        c1, c2 = st.columns([1, 1])
-        if c1.button("인증 코드 발송", type="primary"):
-            em = email.strip().lower()
-            if em not in allow:
-                st.error("등록되지 않은 관리자 이메일입니다.")
-            elif time.time() - st.session_state.get("otp_last_sent", 0) < OTP_RESEND_SEC:
-                wait = int(OTP_RESEND_SEC - (time.time() - st.session_state.get("otp_last_sent", 0)))
-                st.warning(f"재발송은 {wait}초 후에 가능합니다.")
-            else:
-                code = f"{_pysecrets.randbelow(1000000):06d}"
-                if _send_otp_email(em, code):
-                    _store_otp(em, code)
-                    st.success("인증 코드를 발송했습니다. 메일함(스팸함 포함)을 확인하세요.")
-                else:
-                    st.error("메일 발송 실패 — SMTP_USER / SMTP_PASSWORD 설정을 확인하세요.")
-
-        if st.session_state.get("otp_hash"):
-            entered = st.text_input("6자리 인증 코드", max_chars=6, key="adm_otp_in")
-            if c2.button("코드 확인"):
-                ok, msg = _verify_otp(entered)
-                if ok:
-                    st.session_state.admin_authed = True
-                    st.rerun()
-                else:
-                    st.error(msg)
-        st.stop()
-
-    # 데이터 로드 (비캐시)
-    try:
-        records = admin_fetch_records()
-    except Exception as e:
-        st.error(f"시트 연결 실패: {e}")
-        st.stop()
-
-    # 유형별 활성 현황
-    counts = _active_count_by_type(records)
-    cols = st.columns(4)
-    for i, t in enumerate(VALID_TYPES):
-        fwd, rev = counts[t]
-        warn = " ⚠️" if (fwd <= MIN_FWD_PER_TYPE or rev <= MIN_REV_PER_TYPE) else ""
-        cols[i].metric(t, f"순{fwd}·역{rev}{warn}")
-    if any(counts[t][0] < MIN_FWD_PER_TYPE or counts[t][1] < MIN_REV_PER_TYPE for t in VALID_TYPES):
-        st.warning(f"유형별 순방향 {MIN_FWD_PER_TYPE}·역방향 {MIN_REV_PER_TYPE} 미만이면 풀이 사용되지 않고 기본 문항으로 대체됩니다.")
-    st.divider()
-
-    # 새 문항 추가
-    with st.expander("➕ 새 문항 추가", expanded=False):
-        new_text = st.text_input("문항 텍스트", key="adm_new_text")
-        c1, c2 = st.columns([1, 1])
-        new_type = c1.selectbox("유형", VALID_TYPES, key="adm_new_type")
-        new_rev  = c2.checkbox("역코딩 문항", key="adm_new_rev")
-        if st.button("추가", key="adm_add_btn"):
-            if not new_text.strip():
-                st.error("문항 텍스트를 입력하세요.")
-            else:
-                no = admin_add_question(new_text, new_type, new_rev)
-                st.success(f"문항 추가 완료 (no={no})")
-                st.rerun()
-
-    st.divider()
-    st.markdown(f"**전체 문항 {len(records)}개** · 변경은 사용자 화면에 즉시 반영됩니다.")
-
-    # 문항 목록
-    for r in records:
-        no_  = r.get("no", "")
-        text = str(r.get("text", ""))
-        typ  = str(r.get("type", "")).strip()
-        rev  = _to_bool(r.get("reverse", ""))
-        act  = _to_bool(r.get("active", ""))
-
-        c1, c2, c3, c4, c5 = st.columns([0.6, 5, 1.2, 1.4, 1.2])
-        c1.markdown(f"`{no_}`")
-        style = "" if act else "color:gray;text-decoration:line-through;"
-        rev_tag = " · 역코딩" if rev else ""
-        c2.markdown(f"<span style='{style}'>{text}</span><br><small>{typ}{rev_tag}</small>",
-                    unsafe_allow_html=True)
-
-        # 활성/비활성 토글
-        if act:
-            if c3.button("비활성", key=f"adm_off_{no_}"):
-                ok, msg = can_remove_from_active(records, no_)
-                if ok:
-                    admin_set_active(no_, False)
-                    st.rerun()
-                else:
-                    st.error(msg)
+    """사이드바 관리자 영역(secrets의 ADMIN_CODE 일치 시). 최초 200 일괄 발송."""
+    admin_code = st.secrets.get("ADMIN_CODE", "")
+    with st.sidebar:
+        st.markdown("#### 관리자")
+        if not admin_code:
+            st.caption("ADMIN_CODE 미설정")
+            return
+        code_in = st.text_input("관리자 코드", type="password", key="admin_code_in")
+        if code_in != admin_code:
+            return
+        try:
+            vc = valid_count()
+            locked = norm_locked()
+        except Exception as e:
+            st.error(f"시트 접근 오류: {e}")
+            return
+        st.metric("유효 응답", f"{vc} / {NORM_THRESHOLD}")
+        st.caption(f"정규화 잠금: {'완료' if locked else '대기'}")
+        if locked:
+            if st.button("미발송 결과 일괄 발송", use_container_width=True):
+                prog = st.progress(0.0, text="발송 준비…")
+                try:
+                    n = send_pending_results(progress=prog)
+                    st.success(f"발송 처리 완료 (대상 {n}건). 실패분은 다시 눌러 재시도하세요.")
+                except Exception as e:
+                    st.error(f"발송 오류: {e} — 다시 눌러 재시도하세요.")
         else:
-            if c3.button("활성", key=f"adm_on_{no_}"):
-                admin_set_active(no_, True)
-                st.rerun()
-
-        # 삭제 — 2단계 확인
-        pending = st.session_state.get("adm_del_pending")
-        if pending == no_:
-            if c4.button("⚠️ 확인 삭제", key=f"adm_delc_{no_}", type="primary"):
-                ok, msg = can_remove_from_active(records, no_)
-                if ok:
-                    admin_delete_question(no_)
-                    st.session_state.adm_del_pending = None
-                    st.rerun()
-                else:
-                    st.session_state.adm_del_pending = None
-                    st.error(msg)
-            if c5.button("취소", key=f"adm_delx_{no_}"):
-                st.session_state.adm_del_pending = None
-                st.rerun()
-        else:
-            if c4.button("삭제", key=f"adm_del_{no_}"):
-                st.session_state.adm_del_pending = no_
-                st.rerun()
-
-    st.divider()
-    if st.button("로그아웃"):
-        st.session_state.admin_authed = False
-        st.rerun()
+            st.caption("유효 200 도달 후 일괄 발송 버튼이 활성화됩니다.")
 
 
-# ─────────────────────────────────────────────
-# 라우터
-# ─────────────────────────────────────────────
-if st.query_params.get("mode") == "admin":
+def main():
+    st.set_page_config(page_title="AIQ 진단", page_icon="🧭", layout="centered")
+    st.markdown(f"<div style='text-align:right;color:#888;font-size:12px'>{APP_VERSION}</div>", unsafe_allow_html=True)
     render_admin()
-else:
-    stage = st.session_state.get("stage", 0)
-    if   stage == 0: stage_0()
-    elif stage == 1: stage_1()
-    elif stage == 2: stage_2()
-    else:            stage_3()
+    ss = st.session_state
+    stage = ss.get("stage", "auth")
+    if stage == "auth" or not ss.get("verified"):
+        render_auth()
+    else:
+        render_flow()
+
+
+if __name__ == "__main__":
+    main()
+
+
